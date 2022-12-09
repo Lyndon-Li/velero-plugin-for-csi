@@ -28,6 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 
 	"github.com/vmware-tanzu/velero-plugin-for-csi/internal/util"
@@ -100,7 +101,7 @@ func (p *PVCBackupItemAction) Execute(item runtime.Unstructured, backup *velerov
 	}
 
 	p.Log.Infof("Fetching storage class for PV %s", *pvc.Spec.StorageClassName)
-	storageClass, err := client.StorageV1().StorageClasses().Get(context.TODO(), *pvc.Spec.StorageClassName, metav1.GetOptions{})
+	storageClass, err := client.StorageV1().StorageClasses().Get(context.Background(), *pvc.Spec.StorageClassName, metav1.GetOptions{})
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "error getting storage class")
 	}
@@ -128,7 +129,7 @@ func (p *PVCBackupItemAction) Execute(item runtime.Unstructured, backup *velerov
 		},
 	}
 
-	upd, err := snapshotClient.SnapshotV1().VolumeSnapshots(pvc.Namespace).Create(context.TODO(), &snapshot, metav1.CreateOptions{})
+	upd, err := snapshotClient.SnapshotV1().VolumeSnapshots(pvc.Namespace).Create(context.Background(), &snapshot, metav1.CreateOptions{})
 	if err != nil {
 		return nil, nil, errors.Wrapf(err, "error creating volume snapshot")
 	}
@@ -145,12 +146,31 @@ func (p *PVCBackupItemAction) Execute(item runtime.Unstructured, backup *velerov
 	util.AddAnnotations(&pvc.ObjectMeta, annotations)
 	util.AddLabels(&pvc.ObjectMeta, labels)
 
-	additionalItems := []velero.ResourceIdentifier{
-		{
-			GroupResource: kuberesource.VolumeSnapshots,
-			Namespace:     upd.Namespace,
-			Name:          upd.Name,
-		},
+	additionalItems := []velero.ResourceIdentifier{}
+	if util.IsMovingVolumeSnapshot() {
+		err := util.WaitVolumeSnapshotReady(context.Background(), snapshotClient, upd, util.GetVolumeSnapshotWaitTimeout(), p.Log)
+		if err != nil {
+			return nil, nil, errors.Wrapf(err, "error wait volume snapshot ready")
+		}
+
+		backupContext, err := moveVolumeSnapshot(context.Background(), client, backup, upd, p.Log)
+		if err != nil {
+			p.Log.Errorf("Failed to submit data movement VolumeSnapshot %s/%s", fmt.Sprintf("%s/%s", upd.Namespace, upd.Name))
+
+			util.DeleteVolumeSnapshotIfAny(context.Background(), snapshotClient, upd, p.Log)
+			return nil, nil, errors.Wrapf(err, "error creating volume snapshot")
+		} else {
+			p.Log.Debugf("Data movement for VolumeSnapshot %s/%s is submitted successfully", fmt.Sprintf("%s/%s", upd.Namespace, upd.Name))
+			util.AsyncWatchSnapshotBackup(context.Background(), client, snapshotClient, backupContext, p.Log)
+		}
+	} else {
+		additionalItems = []velero.ResourceIdentifier{
+			{
+				GroupResource: kuberesource.VolumeSnapshots,
+				Namespace:     upd.Namespace,
+				Name:          upd.Name,
+			},
+		}
 	}
 
 	p.Log.Infof("Returning from PVCBackupItemAction with %d additionalItems to backup", len(additionalItems))
@@ -164,4 +184,59 @@ func (p *PVCBackupItemAction) Execute(item runtime.Unstructured, backup *velerov
 	}
 
 	return &unstructured.Unstructured{Object: pvcMap}, additionalItems, nil
+}
+
+func moveVolumeSnapshot(ctx context.Context, kubeClient *kubernetes.Clientset, backup *velerov1api.Backup,
+	volumeSnapshot *snapshotv1api.VolumeSnapshot, log logrus.FieldLogger) (*util.SnpahotBackupContext, error) {
+	snapshotRef := &corev1api.TypedLocalObjectReference{
+		APIGroup: &snapshotv1api.SchemeGroupVersion.Group,
+		Kind:     "VolumeSnapshot",
+		Name:     volumeSnapshot.Name,
+	}
+
+	pvc := &corev1api.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:    backup.Namespace,
+			GenerateName: backup.Name + "-",
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: velerov1api.SchemeGroupVersion.String(),
+					Kind:       "Backup",
+					Name:       backup.Name,
+					UID:        backup.UID,
+					Controller: boolptr.True(),
+				},
+			},
+			Labels: map[string]string{
+				velerov1api.BackupNameLabel: label.GetValidName(backup.Name),
+				velerov1api.BackupUIDLabel:  string(backup.UID),
+			},
+		},
+		Spec: corev1api.PersistentVolumeClaimSpec{
+			DataSource:    snapshotRef,
+			DataSourceRef: snapshotRef,
+		},
+	}
+
+	created, err := kubeClient.CoreV1().PersistentVolumeClaims(backup.Namespace).Create(ctx, pvc, metav1.CreateOptions{})
+	if err != nil {
+		return nil, errors.Wrap(err, "error to create pvc")
+	}
+
+	snapshotPV, err := util.GetPVForPVC(created, kubeClient.CoreV1())
+	if err != nil {
+		util.DeletePVCIfAny(ctx, kubeClient, created, log)
+		return nil, errors.Wrap(err, "error to create pv from snapshot")
+	}
+
+	snapshotBackup, err := util.CreateSnapshotBackup(ctx, backup, volumeSnapshot, snapshotPV)
+	if err != nil {
+		util.DeletePVCIfAny(ctx, kubeClient, created, log)
+		return nil, errors.Wrap(err, "error to create SnapshotBackup CR")
+	}
+
+	return &util.SnpahotBackupContext{
+		VolumeSnapshot: volumeSnapshot,
+		SnapshotPVC:    created,
+		SnapshotBackup: snapshotBackup}, nil
 }

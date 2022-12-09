@@ -32,6 +32,11 @@ import (
 
 	"github.com/vmware-tanzu/velero-plugin-for-csi/internal/util"
 	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
+
+	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+
+	snapshotterClientSet "github.com/kubernetes-csi/external-snapshotter/client/v4/clientset/versioned"
+	"k8s.io/client-go/kubernetes"
 )
 
 const (
@@ -99,7 +104,8 @@ func setPVCStorageResourceRequest(pvc *corev1api.PersistentVolumeClaim, restoreS
 // can be pre-populated with data from the volumesnapshot.
 func (p *PVCRestoreItemAction) Execute(input *velero.RestoreItemActionExecuteInput) (*velero.RestoreItemActionExecuteOutput, error) {
 	var pvc corev1api.PersistentVolumeClaim
-	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(input.Item.UnstructuredContent(), &pvc); err != nil {
+	err := runtime.DefaultUnstructuredConverter.FromUnstructured(input.Item.UnstructuredContent(), &pvc)
+	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 	p.Log.Infof("Starting PVCRestoreItemAction for PVC %s/%s", pvc.Namespace, pvc.Name)
@@ -113,40 +119,26 @@ func (p *PVCRestoreItemAction) Execute(input *velero.RestoreItemActionExecuteInp
 		pvc.SetNamespace(val)
 	}
 
-	volumeSnapshotName, ok := pvc.Annotations[util.VolumeSnapshotLabel]
-	if !ok {
-		p.Log.Infof("Skipping PVCRestoreItemAction for PVC %s/%s, PVC does not have a CSI volumesnapshot.", pvc.Namespace, pvc.Name)
-		return &velero.RestoreItemActionExecuteOutput{
-			UpdatedItem: input.Item,
-		}, nil
-	}
-
-	_, snapClient, err := util.GetClients()
+	client, snapClient, err := util.GetClients()
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 
-	vs, err := snapClient.SnapshotV1().VolumeSnapshots(pvc.Namespace).Get(context.TODO(), volumeSnapshotName, metav1.GetOptions{})
-	if err != nil {
-		return nil, errors.Wrapf(err, fmt.Sprintf("Failed to get Volumesnapshot %s/%s to restore PVC %s/%s", pvc.Namespace, volumeSnapshotName, pvc.Namespace, pvc.Name))
-	}
-
-	if _, exists := vs.Annotations[util.VolumeSnapshotRestoreSize]; exists {
-		restoreSize, err := resource.ParseQuantity(vs.Annotations[util.VolumeSnapshotRestoreSize])
+	if util.IsMovingVolumeSnapshot() {
+		restoreContext, err := RestoreFromDataMovement(context.Background(), client, input.Restore, &pvc, p.Log)
 		if err != nil {
-			return nil, errors.Wrapf(err, fmt.Sprintf("Failed to parse %s from annotation on Volumesnapshot %s/%s into restore size",
-				vs.Annotations[util.VolumeSnapshotRestoreSize], vs.Namespace, vs.Name))
+			p.Log.WithError(err).Error("Failed to restore PVC %s/%s from data movement", pvc.Namespace, pvc.Name)
+			return nil, errors.WithStack(err)
 		}
-		// It is possible that the volume provider allocated a larger capacity volume than what was requested in the backed up PVC.
-		// In this scenario the volumesnapshot of the PVC will endup being larger than its requested storage size.
-		// Such a PVC, on restore as-is, will be stuck attempting to use a Volumesnapshot as a data source for a PVC that
-		// is not large enough.
-		// To counter that, here we set the storage request on the PVC to the larger of the PVC's storage request and the size of the
-		// VolumeSnapshot
-		setPVCStorageResourceRequest(&pvc, restoreSize, p.Log)
-	}
 
-	resetPVCSpec(&pvc, volumeSnapshotName)
+		util.AsyncWatchSnapshotRestore(context.Background(), client, snapClient, restoreContext, p.Log)
+	} else {
+		err = RestoreFromVolumeSnapshot(&pvc, snapClient, p.Log)
+		if err != nil {
+			p.Log.WithError(err).Error("Failed to restore PVC %s/%s from volume snapshot", pvc.Namespace, pvc.Name)
+			return nil, errors.WithStack(err)
+		}
+	}
 
 	pvcMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&pvc)
 	if err != nil {
@@ -157,4 +149,66 @@ func (p *PVCRestoreItemAction) Execute(input *velero.RestoreItemActionExecuteInp
 	return &velero.RestoreItemActionExecuteOutput{
 		UpdatedItem: &unstructured.Unstructured{Object: pvcMap},
 	}, nil
+}
+
+func RestoreFromVolumeSnapshot(pvc *corev1api.PersistentVolumeClaim, snapClient *snapshotterClientSet.Clientset, Log logrus.FieldLogger) error {
+	volumeSnapshotName, ok := pvc.Annotations[util.VolumeSnapshotLabel]
+	if !ok {
+		Log.Infof("Skipping PVCRestoreItemAction for PVC %s/%s, PVC does not have a CSI volumesnapshot.", pvc.Namespace, pvc.Name)
+		return nil
+	}
+
+	vs, err := snapClient.SnapshotV1().VolumeSnapshots(pvc.Namespace).Get(context.TODO(), volumeSnapshotName, metav1.GetOptions{})
+	if err != nil {
+		return errors.Wrapf(err, fmt.Sprintf("Failed to get Volumesnapshot %s/%s to restore PVC %s/%s", pvc.Namespace, volumeSnapshotName, pvc.Namespace, pvc.Name))
+	}
+
+	if _, exists := vs.Annotations[util.VolumeSnapshotRestoreSize]; exists {
+		restoreSize, err := resource.ParseQuantity(vs.Annotations[util.VolumeSnapshotRestoreSize])
+		if err != nil {
+			return errors.Wrapf(err, fmt.Sprintf("Failed to parse %s from annotation on Volumesnapshot %s/%s into restore size",
+				vs.Annotations[util.VolumeSnapshotRestoreSize], vs.Namespace, vs.Name))
+		}
+		// It is possible that the volume provider allocated a larger capacity volume than what was requested in the backed up PVC.
+		// In this scenario the volumesnapshot of the PVC will endup being larger than its requested storage size.
+		// Such a PVC, on restore as-is, will be stuck attempting to use a Volumesnapshot as a data source for a PVC that
+		// is not large enough.
+		// To counter that, here we set the storage request on the PVC to the larger of the PVC's storage request and the size of the
+		// VolumeSnapshot
+		setPVCStorageResourceRequest(pvc, restoreSize, Log)
+	}
+
+	resetPVCSpec(pvc, volumeSnapshotName)
+
+	return nil
+}
+
+func RestoreFromDataMovement(ctx context.Context, kubeClient *kubernetes.Clientset,
+	restore *velerov1api.Restore, pvc *corev1api.PersistentVolumeClaim, log logrus.FieldLogger) (*util.SnpahotRestoreContext, error) {
+	pv := &corev1api.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: pvc.Name + "-",
+		},
+		Spec: corev1api.PersistentVolumeSpec{
+			StorageClassName: *pvc.Spec.StorageClassName,
+			AccessModes:      pvc.Spec.AccessModes,
+			Capacity:         corev1api.ResourceList{corev1api.ResourceName(corev1api.ResourceStorage): resource.MustParse("2Gi")},
+		},
+	}
+
+	created, err := kubeClient.CoreV1().PersistentVolumes().Create(ctx, pv, metav1.CreateOptions{})
+	if err != nil {
+		return nil, errors.Wrap(err, "error to create pv")
+	}
+
+	util.RebindPV(pvc, created)
+
+	snapshotRestore, err := util.CreateSnapshotRestore(ctx, restore, created)
+	if err != nil {
+		return nil, errors.Wrap(err, "error to create SnapshotBackup CR")
+	}
+
+	return &util.SnpahotRestoreContext{
+		TargetPVC:       pvc,
+		SnapshotRestore: snapshotRestore}, nil
 }
