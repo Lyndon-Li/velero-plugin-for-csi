@@ -21,6 +21,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
+	"github.com/vmware-tanzu/velero-plugin-for-csi/internal/util"
 
 	corev1api "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -323,7 +324,7 @@ func TestResetPVCResourceRequest(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			log := logrus.New().WithField("unit-test", tc.name)
-			setPVCStorageResourceRequest(&tc.pvc, tc.restoreSize, log)
+			util.SetPVCStorageResourceRequest(&tc.pvc, tc.restoreSize, log)
 			expected, err := resource.ParseQuantity(tc.expectedStorageRequestQty)
 			assert.NoError(t, err)
 			assert.Equal(t, expected, tc.pvc.Spec.Resources.Requests[corev1api.ResourceStorage])
