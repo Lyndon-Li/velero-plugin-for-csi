@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	jsonpatch "github.com/evanphx/json-patch"
 	snapshotv1api "github.com/kubernetes-csi/external-snapshotter/client/v4/apis/volumesnapshot/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -44,6 +45,8 @@ import (
 	"github.com/vmware-tanzu/velero/pkg/label"
 	"github.com/vmware-tanzu/velero/pkg/podvolume"
 	"github.com/vmware-tanzu/velero/pkg/util/boolptr"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
 
 const (
@@ -386,7 +389,6 @@ func DeletePVCIfAny(ctx context.Context, kubeClient *kubernetes.Clientset, pvc *
 
 func DeleteVolumeSnapshotIfAny(ctx context.Context, snapshotClient *snapshotterClientSet.Clientset, volumeSnapshot *snapshotv1api.VolumeSnapshot, log logrus.FieldLogger) {
 	if volumeSnapshot != nil {
-		snapshotClient.SnapshotV1().VolumeSnapshots(volumeSnapshot.Namespace)
 		err := snapshotClient.SnapshotV1().VolumeSnapshots(volumeSnapshot.Namespace).Delete(ctx, volumeSnapshot.Name, *&metav1.DeleteOptions{})
 		if err != nil {
 			log.WithError(err).Errorf("Failed to delete volume snapshot %s", volumeSnapshot.Name)
@@ -541,4 +543,98 @@ func ResetPVCSpec(pvc *corev1api.PersistentVolumeClaim, vsName string) {
 	}
 	pvc.Spec.DataSource = dataSourceRef
 	pvc.Spec.DataSourceRef = dataSourceRef
+}
+
+func RetainVSCIfAny(ctx context.Context, snapshotClient *snapshotterClientSet.Clientset, vsc *snapshotv1api.VolumeSnapshotContent) (bool, error) {
+	if vsc.Spec.DeletionPolicy == snapshotv1api.VolumeSnapshotContentRetain {
+		return false, nil
+	}
+	origBytes, err := json.Marshal(vsc)
+	if err != nil {
+		return false, errors.Wrap(err, "error marshalling original VSC")
+	}
+
+	updated := vsc.DeepCopy()
+	updated.Spec.DeletionPolicy = snapshotv1api.VolumeSnapshotContentRetain
+
+	updatedBytes, err := json.Marshal(updated)
+	if err != nil {
+		return false, errors.Wrap(err, "error marshalling updated VSC")
+	}
+
+	patchBytes, err := jsonpatch.CreateMergePatch(origBytes, updatedBytes)
+	if err != nil {
+		return false, errors.Wrap(err, "error creating json merge patch for VSC")
+	}
+
+	_, err = snapshotClient.SnapshotV1().VolumeSnapshotContents().Patch(ctx, vsc.Name, types.MergePatchType, patchBytes, metav1.PatchOptions{})
+	if err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+func EnsureDeleteVS(ctx context.Context, snapshotClient *snapshotterClientSet.Clientset,
+	vs *snapshotv1api.VolumeSnapshot, timeout time.Duration, log logrus.FieldLogger) error {
+	if vs == nil {
+		return nil
+	}
+
+	err := snapshotClient.SnapshotV1().VolumeSnapshots(vs.Namespace).Delete(ctx, vs.Name, metav1.DeleteOptions{})
+	if err != nil {
+		return errors.Wrap(err, "error to delete volume snapshot")
+	}
+
+	interval := 1 * time.Second
+	err = wait.PollImmediate(interval, timeout, func() (bool, error) {
+		_, err := snapshotClient.SnapshotV1().VolumeSnapshots(vs.Namespace).Get(ctx, vs.Name, metav1.GetOptions{})
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return true, nil
+			}
+
+			return false, errors.Wrapf(err, fmt.Sprintf("failed to get VolumeSnapshot %s", vs.Name))
+		}
+
+		return false, nil
+	})
+
+	if err != nil {
+		return errors.Wrapf(err, "fail to retrieve VolumeSnapshot %s info", vs.Name)
+	}
+
+	return nil
+}
+
+func EnsureDeleteVSC(ctx context.Context, snapshotClient *snapshotterClientSet.Clientset,
+	vsc *snapshotv1api.VolumeSnapshotContent, timeout time.Duration, log logrus.FieldLogger) error {
+	if vsc == nil {
+		return nil
+	}
+
+	err := snapshotClient.SnapshotV1().VolumeSnapshotContents().Delete(ctx, vsc.Name, metav1.DeleteOptions{})
+	if err != nil {
+		return errors.Wrap(err, "error to delete volume snapshotContent")
+	}
+
+	interval := 1 * time.Second
+	err = wait.PollImmediate(interval, timeout, func() (bool, error) {
+		_, err := snapshotClient.SnapshotV1().VolumeSnapshotContents().Get(ctx, vsc.Name, metav1.GetOptions{})
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return true, nil
+			}
+
+			return false, errors.Wrapf(err, fmt.Sprintf("failed to get VolumeSnapshotContent %s", vsc.Name))
+		}
+
+		return false, nil
+	})
+
+	if err != nil {
+		return errors.Wrapf(err, "fail to retrieve VolumeSnapshotContent %s info", vsc.Name)
+	}
+
+	return nil
 }
