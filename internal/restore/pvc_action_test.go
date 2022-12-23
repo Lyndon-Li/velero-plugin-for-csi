@@ -220,7 +220,7 @@ func TestResetPVCSpec(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			before := tc.pvc.DeepCopy()
-			resetPVCSpec(&tc.pvc, tc.vsName)
+			util.ResetPVCSpec(&tc.pvc, tc.vsName)
 
 			assert.Equalf(t, tc.pvc.Name, before.Name, "unexpected change to Object.Name, Want: %s; Got %s", before.Name, tc.pvc.Name)
 			assert.Equalf(t, tc.pvc.Namespace, before.Namespace, "unexpected change to Object.Namespace, Want: %s; Got %s", before.Namespace, tc.pvc.Namespace)

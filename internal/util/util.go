@@ -18,6 +18,7 @@ package util
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -334,6 +335,11 @@ func GetDataMovementWaitTimeout() time.Duration {
 	return defaultDataMovementTimeout
 }
 
+func GetBindWaitTimeout() time.Duration {
+	defaultBindTimeout := 1 * time.Minute
+	return defaultBindTimeout
+}
+
 func GetUploaderType() string {
 	return "kopia"
 }
@@ -388,6 +394,15 @@ func DeleteVolumeSnapshotIfAny(ctx context.Context, snapshotClient *snapshotterC
 	}
 }
 
+func DeletePodIfAny(ctx context.Context, kubeClient *kubernetes.Clientset, pod *corev1api.Pod, log logrus.FieldLogger) {
+	if pod != nil {
+		tmpErr := kubeClient.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
+		if tmpErr != nil {
+			log.WithError(tmpErr).WithField("pod", pod.Name).Error("Failed to delete pod")
+		}
+	}
+}
+
 func GetVolumeModeFromBackup(backup *velerov1api.Backup) corev1api.PersistentVolumeMode {
 	return corev1api.PersistentVolumeFilesystem
 }
@@ -396,29 +411,108 @@ func GetVolumeModeFromRestore(backup *velerov1api.Restore) corev1api.PersistentV
 	return corev1api.PersistentVolumeFilesystem
 }
 
-func RebindPV(targetPVC *corev1api.PersistentVolumeClaim,
-	restorePVC *corev1api.PersistentVolumeClaim, log logrus.FieldLogger) error {
-	if targetPVC.Spec.VolumeName != "" {
-		return errors.Errorf("target pvc has already bound, volume name %s", targetPVC.Spec.VolumeName)
+func WaitPVCBound(ctx context.Context, pvcGetter corev1client.PersistentVolumeClaimsGetter,
+	pvGetter corev1client.PersistentVolumesGetter, pvc *corev1api.PersistentVolumeClaim,
+	timeout time.Duration) (*corev1api.PersistentVolumeClaim, *corev1api.PersistentVolume, error) {
+	eg, _ := errgroup.WithContext(ctx)
+	interval := 5 * time.Second
+
+	var updated *corev1api.PersistentVolumeClaim
+	eg.Go(func() error {
+		err := wait.PollImmediate(interval, timeout, func() (bool, error) {
+			tmpPVC, err := pvcGetter.PersistentVolumeClaims(pvc.Namespace).Get(ctx, pvc.Name, metav1.GetOptions{})
+			if err != nil {
+				return false, errors.Wrapf(err, fmt.Sprintf("failed to get pvc %s/%s", pvc.Namespace, pvc.Name))
+			}
+
+			if tmpPVC.Spec.VolumeName == "" {
+				return false, nil
+			}
+
+			updated = tmpPVC
+
+			return true, nil
+		})
+
+		return err
+	})
+
+	err := eg.Wait()
+	if err != nil {
+		return nil, nil, err
 	}
 
-	if metav1.HasAnnotation(targetPVC.ObjectMeta, kubeAnnBoundByController) {
-		return errors.Errorf("target pvc has already bound, annotation %s exists", kubeAnnBoundByController)
+	pv, err := pvGetter.PersistentVolumes().Get(ctx, updated.Spec.VolumeName, metav1.GetOptions{})
+	if err != nil {
+		return nil, nil, err
 	}
 
-	if metav1.HasAnnotation(targetPVC.ObjectMeta, kubeAnnBindCompleted) {
-		return errors.Errorf("target pvc has already bound, annotation %s exists", kubeAnnBindCompleted)
+	return updated, pv, err
+}
+
+func RebindPV(ctx context.Context, pvGetter corev1client.PersistentVolumesGetter,
+	pv *corev1api.PersistentVolume, pvc *corev1api.PersistentVolumeClaim) error {
+
+	patchPV := corev1api.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        pv.Name,
+			Annotations: map[string]string{},
+		},
+		Spec: corev1api.PersistentVolumeSpec{
+			ClaimRef: &corev1api.ObjectReference{
+				Namespace:       pvc.Namespace,
+				Name:            pvc.Name,
+				UID:             pvc.UID,
+				ResourceVersion: pvc.ResourceVersion,
+			},
+		},
 	}
 
-	targetPVC.Spec.VolumeName = restorePVC.Name
-	metav1.SetMetaDataAnnotation(&targetPVC.ObjectMeta, kubeAnnBoundByController, "yes")
-	metav1.SetMetaDataAnnotation(&targetPVC.ObjectMeta, kubeAnnBindCompleted, "yes")
+	var patchData []byte
+	patchData, err := json.Marshal(patchPV)
+	if err != nil {
+		return err
+	}
 
-	if val, exists := targetPVC.Spec.Resources.Requests[corev1api.ResourceStorage]; exists {
-		SetPVCStorageResourceRequest(targetPVC, val, log)
+	_, err = pvGetter.PersistentVolumes().Patch(ctx, pv.Name, types.StrategicMergePatchType, patchData, metav1.PatchOptions{})
+	if err != nil {
+		return err
 	}
 
 	return nil
+}
+
+func WaitPVCBindLost(ctx context.Context, pvcGetter corev1client.PersistentVolumeClaimsGetter,
+	pvc *corev1api.PersistentVolumeClaim, timeout time.Duration) (*corev1api.PersistentVolumeClaim, error) {
+	eg, _ := errgroup.WithContext(ctx)
+	interval := 5 * time.Second
+
+	var updated *corev1api.PersistentVolumeClaim
+	eg.Go(func() error {
+		err := wait.PollImmediate(interval, timeout, func() (bool, error) {
+			tmpPVC, err := pvcGetter.PersistentVolumeClaims(pvc.Namespace).Get(ctx, pvc.Name, metav1.GetOptions{})
+			if err != nil {
+				return false, errors.Wrapf(err, fmt.Sprintf("failed to get pvc %s/%s", pvc.Namespace, pvc.Name))
+			}
+
+			if tmpPVC.Status.Phase != corev1api.ClaimLost {
+				return false, nil
+			}
+
+			updated = tmpPVC
+
+			return true, nil
+		})
+
+		return err
+	})
+
+	err := eg.Wait()
+	if err != nil {
+		return nil, err
+	}
+
+	return updated, err
 }
 
 func SetPVCStorageResourceRequest(pvc *corev1api.PersistentVolumeClaim, restoreSize resource.Quantity, log logrus.FieldLogger) {

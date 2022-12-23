@@ -264,13 +264,13 @@ func asyncWatchSnapshotRestore(ctx context.Context, kubeClient *kubernetes.Clien
 	go func() {
 		watchSnapshotRestore(cancelCtx, veleroClient, restoreContext, log)
 		if restoreContext.completeStatus == util.DataMoveCompleted {
-			err := util.RebindPV(restoreContext.targetPVC, restoreContext.restorePVC, log)
-			if err != nil {
-				restoreContext.completeStatus = util.DataMoveFailed
-				restoreContext.completeMsg = err.Error()
-				log.WithError(err).Errorf("Failed to bind PV %s to pvc %s for snapshotRestore %s",
-					restoreContext.restorePVC.Spec.VolumeName, restoreContext.targetPVC.Name, restoreContext.snapshotRestore.Name)
-			}
+			// err := util.RebindPV(restoreContext.targetPVC, restoreContext.restorePVC, log)
+			// if err != nil {
+			// 	restoreContext.completeStatus = util.DataMoveFailed
+			// 	restoreContext.completeMsg = err.Error()
+			// 	log.WithError(err).Errorf("Failed to bind PV %s to pvc %s for snapshotRestore %s",
+			// 		restoreContext.restorePVC.Spec.VolumeName, restoreContext.targetPVC.Name, restoreContext.snapshotRestore.Name)
+			// }
 		}
 
 		cancel()
