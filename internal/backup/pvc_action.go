@@ -265,27 +265,6 @@ func moveVolumeSnapshot(ctx context.Context, kubeClient *kubernetes.Clientset, s
 
 	log.WithField("vsc name", vsc.Name).Infof("VSC is deleted")
 
-	// snapshotPVC, err := createSnapshotPVC(ctx, kubeClient, sourcePVC.Namespace, volumeSnapshot.Name, pvc, log)
-	// if err != nil {
-	// 	return nil, errors.Wrap(err, "error to create snapshot pvc")
-	// }
-
-	// log.WithField("pvc name", snapshotPVC.Name).Infof("Snapshot PVC is created in namespace %s", snapshotPVC.Namespace)
-
-	// provisionPod, err := createProvisonPod(ctx, kubeClient, snapshotPVC)
-	// if err != nil {
-	// 	return nil, errors.Wrap(err, "error to create provision pod")
-	// }
-
-	// log.WithField("pod name", provisionPod.Name).Infof("Provision pod is created in namespace %s", provisionPod.Namespace)
-
-	// snapshotPVC, snapshotPV, err := util.WaitPVCBound(ctx, kubeClient.CoreV1(), kubeClient.CoreV1(), snapshotPVC, util.GetBindWaitTimeout())
-	// if err != nil {
-	// 	return nil, errors.Wrap(err, "error to wait snapshot PVC bound")
-	// }
-
-	// log.WithField("pvc name", snapshotPVC.Name).Infof("Snapshot PVC is bound in namespace %s", snapshotPVC.Namespace)
-
 	backupVS, err := createBackupVS(ctx, snapshotClient, volumeSnapshot, backup, vsc.Name)
 	if err != nil {
 		return nil, errors.Wrap(err, "error to create backup volume snapshot")
@@ -300,28 +279,12 @@ func moveVolumeSnapshot(ctx context.Context, kubeClient *kubernetes.Clientset, s
 
 	util.ResetPVCSpec(pvc, backupVS.Name)
 
-	//backupPVC, err := createBackupPVC(ctx, kubeClient, snapshotPVC, snapshotPV, backup.Namespace, pvc, log)
 	backupPVC, err := createBackupPVC(ctx, kubeClient, backup.Namespace, pvc)
 	if err != nil {
 		return nil, errors.Wrap(err, "error to create backup pvc")
 	}
 
 	log.WithField("pvc name", backupPVC.Name).Info("Backup PVC is created")
-
-	// err = util.RebindPV(ctx, kubeClient.CoreV1(), snapshotPV, backupPVC)
-	// if err != nil {
-
-	// 	return nil, errors.Wrap(err, "error to rebind PV")
-	// }
-
-	// log.WithField("pv name", snapshotPV.Name).Info("Snapshot PV is rebound")
-
-	// _, err = util.WaitPVCBindLost(ctx, kubeClient.CoreV1(), snapshotPVC, util.GetBindWaitTimeout())
-	// if err != nil {
-	// 	return nil, errors.Wrap(err, "error to wait snapshot PVC to lose bind")
-	// }
-
-	// log.WithField("pvc name", snapshotPVC.Name).Infof("Snapshot PVC has lost binding in namespace %s", snapshotPVC.Namespace)
 
 	snapshotBackup, err := createSnapshotBackup(ctx, backup, veleroClient, sourcePVC, backupPVC)
 	if err != nil {
@@ -331,9 +294,6 @@ func moveVolumeSnapshot(ctx context.Context, kubeClient *kubernetes.Clientset, s
 	log.WithField("snapshotBackup name", snapshotBackup.Name).Infof("SnapshotBackup CR is created")
 
 	defer func() {
-		//util.DeletePodIfAny(ctx, kubeClient, provisionPod, log)
-		//util.DeletePVCIfAny(ctx, kubeClient, snapshotPVC, log)
-
 		if err != nil {
 			util.DeletePVCIfAny(ctx, kubeClient, backupPVC, log)
 			util.DeleteVolumeSnapshotIfAny(ctx, snapshotClient, backupVS, log)
@@ -386,23 +346,6 @@ func newSnapshotBackup(backup *velerov1api.Backup, sourcePVC *corev1api.Persiste
 	return snapshotBackup
 }
 
-func createSnapshotPVC(ctx context.Context, kubeClient *kubernetes.Clientset,
-	namespace string, snapshotName string, pvcTemplate *corev1api.PersistentVolumeClaim,
-	log logrus.FieldLogger) (*corev1api.PersistentVolumeClaim, error) {
-
-	copied := pvcTemplate.DeepCopy()
-
-	copied.Namespace = namespace
-	util.ResetPVCSpec(copied, snapshotName)
-
-	pvc, err := kubeClient.CoreV1().PersistentVolumeClaims(copied.Namespace).Create(ctx, copied, metav1.CreateOptions{})
-	if err != nil {
-		return nil, errors.Wrap(err, "error to create pvc")
-	}
-
-	return pvc, err
-}
-
 func createBackupPVC(ctx context.Context, kubeClient *kubernetes.Clientset, namespace string,
 	pvcTemplate *corev1api.PersistentVolumeClaim) (*corev1api.PersistentVolumeClaim, error) {
 	copied := pvcTemplate.DeepCopy()
@@ -435,13 +378,6 @@ func createBackupVS(ctx context.Context, snapshotClient *snapshotterClientSet.Cl
 		},
 	}
 
-	// copied := snapshotVS.DeepCopy()
-	// copied.Namespace = namespace
-	// copied.Spec.Source.PersistentVolumeClaimName = nil
-	// copied.Spec.Source.VolumeSnapshotContentName = &vscName
-	// copied.ResourceVersion = ""
-	// copied.UID = ""
-
 	created, err := snapshotClient.SnapshotV1().VolumeSnapshots(copied.Namespace).Create(ctx, copied, metav1.CreateOptions{})
 	if err != nil {
 		return nil, errors.Wrap(err, "error to create backup volume snapshot")
@@ -472,91 +408,12 @@ func createBackupVSC(ctx context.Context, snapshotClient *snapshotterClientSet.C
 		},
 	}
 
-	// 	copied := snapshotVSC.DeepCopy()
-
-	// copied.Name = "backup-" + snapshotVSC.Name
-	// copied.Spec.Source.VolumeHandle = nil
-	// copied.Spec.Source.SnapshotHandle = snapshotVSC.Status.SnapshotHandle
-	// copied.Spec.VolumeSnapshotRef.Name = vs.Name
-	// copied.Spec.VolumeSnapshotRef.Namespace = vs.Namespace
-	// copied.Spec.VolumeSnapshotRef.UID = vs.UID
-	// copied.Spec.VolumeSnapshotRef.ResourceVersion = vs.ResourceVersion
-	// copied.ResourceVersion = ""
-	// copied.UID = ""
-
 	created, err := snapshotClient.SnapshotV1().VolumeSnapshotContents().Create(ctx, copied, metav1.CreateOptions{})
 	if err != nil {
 		return nil, errors.Wrap(err, "error to create backup volume snapshot content")
 	}
 
 	return created, nil
-}
-
-func createProvisonPod(ctx context.Context, kubeClient *kubernetes.Clientset, pvc *corev1api.PersistentVolumeClaim) (*corev1api.Pod, error) {
-	var rawBlock bool
-	if nil != pvc.Spec.VolumeMode && corev1api.PersistentVolumeBlock == *pvc.Spec.VolumeMode {
-		rawBlock = true
-	}
-
-	podName := fmt.Sprintf("snapshot-%s", pvc.UID)
-
-	pod := &corev1api.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      podName,
-			Namespace: pvc.Namespace,
-		},
-		Spec: makeSnapshotPodSpec(pvc.Name),
-	}
-
-	pod.Spec.Volumes[0].VolumeSource.PersistentVolumeClaim.ClaimName = pvc.Name
-
-	con := &pod.Spec.Containers[0]
-	con.Image = provisionPodImageName
-
-	if rawBlock {
-		con.VolumeDevices = []corev1api.VolumeDevice{
-			{
-				Name:       provisionPodVolumeName,
-				DevicePath: provisionPodDevicePath,
-			},
-		}
-	} else {
-		con.VolumeMounts = []corev1api.VolumeMount{
-			{
-				Name:      provisionPodVolumeName,
-				MountPath: provisionPodMountPath,
-			},
-		}
-	}
-
-	created, err := kubeClient.CoreV1().Pods(pod.Namespace).Create(ctx, pod, metav1.CreateOptions{})
-	if err != nil {
-		return nil, errors.Wrap(err, "error to create provision pod")
-	}
-
-	return created, nil
-}
-
-func makeSnapshotPodSpec(pvcName string) corev1api.PodSpec {
-	return corev1api.PodSpec{
-		Containers: []corev1api.Container{
-			{
-				Name:            provisionPodContainerName,
-				ImagePullPolicy: corev1api.PullIfNotPresent,
-			},
-		},
-		RestartPolicy: corev1api.RestartPolicyNever,
-		Volumes: []corev1api.Volume{
-			{
-				Name: provisionPodVolumeName,
-				VolumeSource: corev1api.VolumeSource{
-					PersistentVolumeClaim: &corev1api.PersistentVolumeClaimVolumeSource{
-						ClaimName: pvcName,
-					},
-				},
-			},
-		},
-	}
 }
 
 func createSnapshotBackup(ctx context.Context, backup *velerov1api.Backup, veleroClient *veleroClientSet.Clientset,
