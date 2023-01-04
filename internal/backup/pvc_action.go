@@ -60,7 +60,7 @@ type PVCBackupItemAction struct {
 }
 
 type snpahotBackupContext struct {
-	volumeSnapshot *snapshotv1api.VolumeSnapshot
+	backupVS       *snapshotv1api.VolumeSnapshot
 	snapshotPVC    *corev1api.PersistentVolumeClaim
 	snapshotBackup *velerov1api.SnapshotBackup
 	cancelRoutine  context.CancelFunc
@@ -251,7 +251,7 @@ func moveVolumeSnapshot(ctx context.Context, kubeClient *kubernetes.Clientset, s
 
 	log.WithField("vsc name", vsc.Name).WithField("vs name", volumeSnapshot.Name).Infof("Got VSC from VS in namespace %s", volumeSnapshot.Namespace)
 
-	retained, err := util.RetainVSCIfAny(ctx, snapshotClient, vsc)
+	retained, err := util.RetainVSC(ctx, snapshotClient, vsc)
 	if err != nil {
 		return nil, errors.Wrap(err, "error to retain volume snapshot content")
 	}
@@ -259,10 +259,8 @@ func moveVolumeSnapshot(ctx context.Context, kubeClient *kubernetes.Clientset, s
 	log.WithField("vsc name", vsc.Name).WithField("retained", (retained != nil)).Info("Finished to retain VSC")
 
 	defer func() {
-		if err != nil {
-			if retained != nil {
-				util.DeleteVolumeSnapshotContentIfAny(ctx, snapshotClient, retained, log)
-			}
+		if retained != nil {
+			util.DeleteVolumeSnapshotContentIfAny(ctx, snapshotClient, retained, log)
 		}
 	}()
 
@@ -323,18 +321,8 @@ func moveVolumeSnapshot(ctx context.Context, kubeClient *kubernetes.Clientset, s
 
 	log.WithField("snapshotBackup name", snapshotBackup.Name).Infof("SnapshotBackup CR is created")
 
-	defer func() {
-		if err != nil {
-			util.DeletePVCIfAny(ctx, kubeClient, backupPVC, log)
-			util.DeleteVolumeSnapshotIfAny(ctx, snapshotClient, backupVS, log)
-			if retained != nil {
-				util.DeleteVolumeSnapshotContentIfAny(ctx, snapshotClient, retained, log)
-			}
-		}
-	}()
-
 	return &snpahotBackupContext{
-		volumeSnapshot: backupVS,
+		backupVS:       backupVS,
 		snapshotPVC:    backupPVC,
 		snapshotBackup: snapshotBackup}, nil
 }
@@ -469,13 +457,13 @@ func asyncWatchSnapshotBackup(ctx context.Context, kubeClient *kubernetes.Client
 	curLog := log.WithFields(logrus.Fields{
 		"snapshot PVC":    backupContext.snapshotPVC.Name,
 		"snapshot backup": backupContext.snapshotBackup.Name,
-		"volume snapshot": backupContext.volumeSnapshot.Name,
+		"backup VS":       backupContext.backupVS.Name,
 	})
 
 	go func() {
 		watchSnapshotBackup(cancelCtx, veleroClient, backupContext, curLog)
 		util.DeletePVCIfAny(cancelCtx, kubeClient, backupContext.snapshotPVC, curLog)
-		util.DeleteVolumeSnapshotIfAny(cancelCtx, snapshotClient, backupContext.volumeSnapshot, curLog)
+		util.DeleteVolumeSnapshotIfAny(cancelCtx, snapshotClient, backupContext.backupVS, curLog)
 		cancel()
 	}()
 }

@@ -50,8 +50,8 @@ import (
 )
 
 const (
-	kubeAnnBindCompleted     = "pv.kubernetes.io/bind-completed"
-	kubeAnnBoundByController = "pv.kubernetes.io/bound-by-controller"
+	KubeAnnBindCompleted     = "pv.kubernetes.io/bind-completed"
+	KubeAnnBoundByController = "pv.kubernetes.io/bound-by-controller"
 )
 
 type DataMoveCompletionStatus string
@@ -402,6 +402,16 @@ func DeleteVolumeSnapshotContentIfAny(ctx context.Context, snapshotClient *snaps
 	}
 }
 
+func DeletePVIfAny(ctx context.Context, kubeClient *kubernetes.Clientset,
+	pv *corev1api.PersistentVolume, log logrus.FieldLogger) {
+	if pv != nil {
+		err := kubeClient.CoreV1().PersistentVolumes().Delete(ctx, pv.Name, *&metav1.DeleteOptions{})
+		if err != nil {
+			log.WithError(err).Errorf("Failed to delete volume snapshot content %s", pv.Name)
+		}
+	}
+}
+
 func GetVolumeModeFromBackup(backup *velerov1api.Backup) corev1api.PersistentVolumeMode {
 	return corev1api.PersistentVolumeFilesystem
 }
@@ -484,8 +494,8 @@ func WaitPVBound(ctx context.Context, pvGetter corev1client.PersistentVolumesGet
 
 func RebindPV(ctx context.Context, pvGetter corev1client.PersistentVolumesGetter, pv *corev1api.PersistentVolume) error {
 	updated := pv.DeepCopy()
-	delete(updated.Annotations, kubeAnnBindCompleted)
-	delete(updated.Annotations, kubeAnnBoundByController)
+	delete(updated.Annotations, KubeAnnBindCompleted)
+	delete(updated.Annotations, KubeAnnBoundByController)
 	pv.Spec.ClaimRef = nil
 
 	var patchData []byte
@@ -563,7 +573,7 @@ func ResetPVCSpec(pvc *corev1api.PersistentVolumeClaim, vsName string) {
 	pvc.Spec.DataSourceRef = dataSourceRef
 }
 
-func RetainVSCIfAny(ctx context.Context, snapshotClient *snapshotterClientSet.Clientset,
+func RetainVSC(ctx context.Context, snapshotClient *snapshotterClientSet.Clientset,
 	vsc *snapshotv1api.VolumeSnapshotContent) (*snapshotv1api.VolumeSnapshotContent, error) {
 	if vsc.Spec.DeletionPolicy == snapshotv1api.VolumeSnapshotContentRetain {
 		return nil, nil
@@ -594,9 +604,8 @@ func RetainVSCIfAny(ctx context.Context, snapshotClient *snapshotterClientSet.Cl
 	return retained, nil
 }
 
-func SetPVReclaimPolicy(ctx context.Context, kubeClient *kubernetes.Clientset,
-	pv *corev1api.PersistentVolume, policy corev1api.PersistentVolumeReclaimPolicy) (*corev1api.PersistentVolume, error) {
-	if pv.Spec.PersistentVolumeReclaimPolicy == policy {
+func RetainPV(ctx context.Context, kubeClient *kubernetes.Clientset, pv *corev1api.PersistentVolume) (*corev1api.PersistentVolume, error) {
+	if pv.Spec.PersistentVolumeReclaimPolicy == corev1api.PersistentVolumeReclaimRetain {
 		return nil, nil
 	}
 
@@ -606,7 +615,7 @@ func SetPVReclaimPolicy(ctx context.Context, kubeClient *kubernetes.Clientset,
 	}
 
 	updated := pv.DeepCopy()
-	updated.Spec.PersistentVolumeReclaimPolicy = policy
+	updated.Spec.PersistentVolumeReclaimPolicy = corev1api.PersistentVolumeReclaimRetain
 
 	updatedBytes, err := json.Marshal(updated)
 	if err != nil {
