@@ -324,10 +324,6 @@ func HasBackupLabel(o *metav1.ObjectMeta, backupName string) bool {
 	return o.Labels[velerov1api.BackupNameLabel] == label.GetValidName(backupName)
 }
 
-func IsMovingVolumeSnapshot() bool {
-	return true
-}
-
 func GetVolumeSnapshotWaitTimeout() time.Duration {
 	defaultCSISnapshotTimeout := 10 * time.Minute
 	return defaultCSISnapshotTimeout
@@ -396,6 +392,16 @@ func DeleteVolumeSnapshotIfAny(ctx context.Context, snapshotClient *snapshotterC
 	}
 }
 
+func DeleteVolumeSnapshotContentIfAny(ctx context.Context, snapshotClient *snapshotterClientSet.Clientset,
+	vsc *snapshotv1api.VolumeSnapshotContent, log logrus.FieldLogger) {
+	if vsc != nil {
+		err := snapshotClient.SnapshotV1().VolumeSnapshotContents().Delete(ctx, vsc.Name, *&metav1.DeleteOptions{})
+		if err != nil {
+			log.WithError(err).Errorf("Failed to delete volume snapshot content %s", vsc.Name)
+		}
+	}
+}
+
 func GetVolumeModeFromBackup(backup *velerov1api.Backup) corev1api.PersistentVolumeMode {
 	return corev1api.PersistentVolumeFilesystem
 }
@@ -444,16 +450,16 @@ func WaitPVCBound(ctx context.Context, pvcGetter corev1client.PersistentVolumeCl
 }
 
 func WaitPVBound(ctx context.Context, pvGetter corev1client.PersistentVolumesGetter,
-	pv *corev1api.PersistentVolume, timeout time.Duration) (*corev1api.PersistentVolume, error) {
+	pvName string, timeout time.Duration) (*corev1api.PersistentVolume, error) {
 	eg, _ := errgroup.WithContext(ctx)
 	interval := 5 * time.Second
 
 	var updated *corev1api.PersistentVolume
 	eg.Go(func() error {
 		err := wait.PollImmediate(interval, timeout, func() (bool, error) {
-			tmpPV, err := pvGetter.PersistentVolumes().Get(ctx, pv.Name, metav1.GetOptions{})
+			tmpPV, err := pvGetter.PersistentVolumes().Get(ctx, pvName, metav1.GetOptions{})
 			if err != nil {
-				return false, errors.Wrapf(err, fmt.Sprintf("failed to get pv %s", pv.Name))
+				return false, errors.Wrapf(err, fmt.Sprintf("failed to get pv %s", pvName))
 			}
 
 			if tmpPV.Spec.ClaimRef == nil {
@@ -476,11 +482,8 @@ func WaitPVBound(ctx context.Context, pvGetter corev1client.PersistentVolumesGet
 	return updated, err
 }
 
-func RebindPV(ctx context.Context, pvGetter corev1client.PersistentVolumesGetter,
-	pv *corev1api.PersistentVolume, pvc *corev1api.PersistentVolumeClaim) error {
-
+func RebindPV(ctx context.Context, pvGetter corev1client.PersistentVolumesGetter, pv *corev1api.PersistentVolume) error {
 	updated := pv.DeepCopy()
-	updated.Name = updated.Name + "-complete"
 	delete(updated.Annotations, kubeAnnBindCompleted)
 	delete(updated.Annotations, kubeAnnBoundByController)
 	pv.Spec.ClaimRef = nil
@@ -560,13 +563,14 @@ func ResetPVCSpec(pvc *corev1api.PersistentVolumeClaim, vsName string) {
 	pvc.Spec.DataSourceRef = dataSourceRef
 }
 
-func RetainVSCIfAny(ctx context.Context, snapshotClient *snapshotterClientSet.Clientset, vsc *snapshotv1api.VolumeSnapshotContent) (bool, error) {
+func RetainVSCIfAny(ctx context.Context, snapshotClient *snapshotterClientSet.Clientset,
+	vsc *snapshotv1api.VolumeSnapshotContent) (*snapshotv1api.VolumeSnapshotContent, error) {
 	if vsc.Spec.DeletionPolicy == snapshotv1api.VolumeSnapshotContentRetain {
-		return false, nil
+		return nil, nil
 	}
 	origBytes, err := json.Marshal(vsc)
 	if err != nil {
-		return false, errors.Wrap(err, "error marshalling original VSC")
+		return nil, errors.Wrap(err, "error marshalling original VSC")
 	}
 
 	updated := vsc.DeepCopy()
@@ -574,32 +578,31 @@ func RetainVSCIfAny(ctx context.Context, snapshotClient *snapshotterClientSet.Cl
 
 	updatedBytes, err := json.Marshal(updated)
 	if err != nil {
-		return false, errors.Wrap(err, "error marshalling updated VSC")
+		return nil, errors.Wrap(err, "error marshalling updated VSC")
 	}
 
 	patchBytes, err := jsonpatch.CreateMergePatch(origBytes, updatedBytes)
 	if err != nil {
-		return false, errors.Wrap(err, "error creating json merge patch for VSC")
+		return nil, errors.Wrap(err, "error creating json merge patch for VSC")
 	}
 
-	_, err = snapshotClient.SnapshotV1().VolumeSnapshotContents().Patch(ctx, vsc.Name, types.MergePatchType, patchBytes, metav1.PatchOptions{})
+	retained, err := snapshotClient.SnapshotV1().VolumeSnapshotContents().Patch(ctx, vsc.Name, types.MergePatchType, patchBytes, metav1.PatchOptions{})
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 
-	return true, nil
+	return retained, nil
 }
 
 func SetPVReclaimPolicy(ctx context.Context, kubeClient *kubernetes.Clientset,
-	pv *corev1api.PersistentVolume, policy corev1api.PersistentVolumeReclaimPolicy) (corev1api.PersistentVolumeReclaimPolicy, error) {
-	curPolicy := pv.Spec.PersistentVolumeReclaimPolicy
-	if curPolicy == policy {
-		return curPolicy, nil
+	pv *corev1api.PersistentVolume, policy corev1api.PersistentVolumeReclaimPolicy) (*corev1api.PersistentVolume, error) {
+	if pv.Spec.PersistentVolumeReclaimPolicy == policy {
+		return nil, nil
 	}
 
 	origBytes, err := json.Marshal(pv)
 	if err != nil {
-		return curPolicy, errors.Wrap(err, "error marshalling original PV")
+		return nil, errors.Wrap(err, "error marshalling original PV")
 	}
 
 	updated := pv.DeepCopy()
@@ -607,24 +610,24 @@ func SetPVReclaimPolicy(ctx context.Context, kubeClient *kubernetes.Clientset,
 
 	updatedBytes, err := json.Marshal(updated)
 	if err != nil {
-		return curPolicy, errors.Wrap(err, "error marshalling updated PV")
+		return nil, errors.Wrap(err, "error marshalling updated PV")
 	}
 
 	patchBytes, err := jsonpatch.CreateMergePatch(origBytes, updatedBytes)
 	if err != nil {
-		return curPolicy, errors.Wrap(err, "error creating json merge patch for PV")
+		return nil, errors.Wrap(err, "error creating json merge patch for PV")
 	}
 
-	_, err = kubeClient.CoreV1().PersistentVolumes().Patch(ctx, pv.Name, types.MergePatchType, patchBytes, metav1.PatchOptions{})
+	updated, err = kubeClient.CoreV1().PersistentVolumes().Patch(ctx, pv.Name, types.MergePatchType, patchBytes, metav1.PatchOptions{})
 	if err != nil {
-		return curPolicy, err
+		return nil, err
 	}
 
-	return curPolicy, nil
+	return updated, nil
 }
 
 func EnsureDeleteVS(ctx context.Context, snapshotClient *snapshotterClientSet.Clientset,
-	vs *snapshotv1api.VolumeSnapshot, timeout time.Duration, log logrus.FieldLogger) error {
+	vs *snapshotv1api.VolumeSnapshot, timeout time.Duration) error {
 	if vs == nil {
 		return nil
 	}
@@ -656,7 +659,7 @@ func EnsureDeleteVS(ctx context.Context, snapshotClient *snapshotterClientSet.Cl
 }
 
 func EnsureDeleteVSC(ctx context.Context, snapshotClient *snapshotterClientSet.Clientset,
-	vsc *snapshotv1api.VolumeSnapshotContent, timeout time.Duration, log logrus.FieldLogger) error {
+	vsc *snapshotv1api.VolumeSnapshotContent, timeout time.Duration) error {
 	if vsc == nil {
 		return nil
 	}
@@ -688,7 +691,7 @@ func EnsureDeleteVSC(ctx context.Context, snapshotClient *snapshotterClientSet.C
 }
 
 func EnsureDeletePVC(ctx context.Context, kubeClient *kubernetes.Clientset,
-	pvc *corev1api.PersistentVolumeClaim, timeout time.Duration, log logrus.FieldLogger) error {
+	pvc *corev1api.PersistentVolumeClaim, timeout time.Duration) error {
 	if pvc == nil {
 		return nil
 	}
@@ -714,6 +717,38 @@ func EnsureDeletePVC(ctx context.Context, kubeClient *kubernetes.Clientset,
 
 	if err != nil {
 		return errors.Wrapf(err, "fail to retrieve pvc info for %s", pvc.Name)
+	}
+
+	return nil
+}
+
+func EnsureDeletePV(ctx context.Context, kubeClient *kubernetes.Clientset,
+	pv *corev1api.PersistentVolume, timeout time.Duration) error {
+	if pv == nil {
+		return nil
+	}
+
+	err := kubeClient.CoreV1().PersistentVolumes().Delete(ctx, pv.Name, metav1.DeleteOptions{})
+	if err != nil {
+		return errors.Wrap(err, "error to delete pvc")
+	}
+
+	interval := 1 * time.Second
+	err = wait.PollImmediate(interval, timeout, func() (bool, error) {
+		_, err := kubeClient.CoreV1().PersistentVolumes().Get(ctx, pv.Name, metav1.GetOptions{})
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return true, nil
+			}
+
+			return false, errors.Wrapf(err, fmt.Sprintf("failed to get pvc %s", pv.Name))
+		}
+
+		return false, nil
+	})
+
+	if err != nil {
+		return errors.Wrapf(err, "fail to retrieve pvc info for %s", pv.Name)
 	}
 
 	return nil

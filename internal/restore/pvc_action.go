@@ -109,14 +109,18 @@ func (p *PVCRestoreItemAction) Execute(input *velero.RestoreItemActionExecuteInp
 		return nil, errors.WithStack(err)
 	}
 
-	if util.IsMovingVolumeSnapshot() {
+	if boolptr.IsSetToTrue(input.Restore.Spec.CSISnapshotMoveData) {
+		curLog := p.Log.WithField("target PVC", fmt.Sprintf("%s/%s", pvc.Namespace, pvc.Name))
+		curLog.Info("Starting data movement restore")
+
 		restoreContext, err := restoreFromDataMovement(context.Background(), client, veleroClient, input.Restore, &pvc, p.Log)
 		if err != nil {
-			p.Log.WithError(err).Error("Failed to restore PVC %s/%s from data movement", pvc.Namespace, pvc.Name)
+			curLog.WithError(err).Error("Failed to submit data movement restore")
 			return nil, errors.WithStack(err)
+		} else {
+			curLog.Info("Data movement restore is submitted successfully")
+			asyncWatchSnapshotRestore(context.Background(), input.Restore, client, veleroClient, restoreContext, p.Log)
 		}
-
-		asyncWatchSnapshotRestore(context.Background(), client, veleroClient, restoreContext, p.Log)
 	} else {
 		err = restoreFromVolumeSnapshot(&pvc, snapClient, p.Log)
 		if err != nil {
@@ -193,31 +197,27 @@ func restoreFromDataMovement(ctx context.Context, kubeClient *kubernetes.Clients
 		},
 	}
 
-	restorePVC, err := kubeClient.CoreV1().PersistentVolumeClaims(pvc.Namespace).Create(ctx, pvcObj, metav1.CreateOptions{})
+	restorePVC, err := kubeClient.CoreV1().PersistentVolumeClaims(pvcObj.Namespace).Create(ctx, pvcObj, metav1.CreateOptions{})
 	if err != nil {
 		return nil, errors.Wrap(err, "error to create restore pvc")
 	}
 
-	log.Infof("Restore PVC %s is created", restorePVC.Name)
+	log.WithField("restorePVC", restorePVC.Name).Infof("Restore PVC is created")
 
-	_, restorePV, err := util.WaitPVCBound(ctx, kubeClient.CoreV1(), kubeClient.CoreV1(), restorePVC, util.GetBindWaitTimeout())
-	if err != nil {
-		return nil, errors.Wrap(err, "error to wait restore pvc bound")
-	}
+	defer func() {
+		if err != nil {
+			util.DeletePVCIfAny(ctx, kubeClient, restorePVC, log)
+		}
+	}()
 
-	log.WithFields(logrus.Fields{
-		"restore PVC": restorePVC.Name,
-		"restore PV":  restorePV.Name,
-	}).Info("Restore PVC is bound")
-
-	pvc.Spec.VolumeName = pvc.Spec.VolumeName + "-complete"
+	pvc.Spec.VolumeName = getRestorePVName(restore, restorePVC)
 
 	snapshotRestore, err := createSnapshotRestore(ctx, veleroClient, restore, snapshotBackup, sourceNamespace, restorePVC)
 	if err != nil {
 		return nil, errors.Wrap(err, "error to create SnapshotBackup CR")
 	}
 
-	log.Infof("SnapshotRestore CR %s is created", snapshotRestore.Name)
+	log.WithField("SnapshotRestore CR", snapshotRestore.Name).Info("SnapshotRestore CR is created")
 
 	return &snpahotRestoreContext{
 		targetPVC:       pvc,
@@ -228,6 +228,10 @@ func restoreFromDataMovement(ctx context.Context, kubeClient *kubernetes.Clients
 func newSnapshotRestore(restore *velerov1api.Restore, snapshotBackup *velerov1api.SnapshotBackup,
 	sourceNamespace string, targetPVC *corev1api.PersistentVolumeClaim) *velerov1api.SnapshotRestore {
 	snapshotRestore := &velerov1api.SnapshotRestore{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: velerov1api.SchemeGroupVersion.String(),
+			Kind:       "SnapshotRestore",
+		},
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace:    restore.Namespace,
 			GenerateName: restore.Name + "-",
@@ -246,7 +250,7 @@ func newSnapshotRestore(restore *velerov1api.Restore, snapshotBackup *velerov1ap
 			},
 		},
 		Spec: velerov1api.SnapshotRestoreSpec{
-			Pvc:                   targetPVC.Name,
+			RestorePvc:            targetPVC.Name,
 			SnapshotID:            snapshotBackup.Status.SnapshotID,
 			BackupStorageLocation: snapshotBackup.Spec.BackupStorageLocation,
 			UploaderType:          util.GetUploaderType(),
@@ -269,57 +273,72 @@ func createSnapshotRestore(ctx context.Context, veleroClient *veleroClientSet.Cl
 	return snapshotRestore, nil
 }
 
-func asyncWatchSnapshotRestore(ctx context.Context, kubeClient *kubernetes.Clientset, veleroClient *veleroClientSet.Clientset,
-	restoreContext *snpahotRestoreContext, log logrus.FieldLogger) {
+func asyncWatchSnapshotRestore(ctx context.Context, restore *velerov1api.Restore, kubeClient *kubernetes.Clientset,
+	veleroClient *veleroClientSet.Clientset, restoreContext *snpahotRestoreContext, log logrus.FieldLogger) {
 	cancelCtx, cancel := context.WithCancel(ctx)
 	restoreContext.cancelRoutine = cancel
+	curLog := log.WithFields(logrus.Fields{
+		"restore PVC":     restoreContext.restorePVC.Name,
+		"target PVC":      restoreContext.targetPVC.Name,
+		"snapshotRestore": restoreContext.snapshotRestore.Name,
+	})
+
 	go func() {
-		watchSnapshotRestore(cancelCtx, veleroClient, restoreContext, log)
+		watchSnapshotRestore(cancelCtx, veleroClient, restoreContext, curLog)
+
 		if restoreContext.completeStatus == util.DataMoveCompleted {
-			err := rebindRestorePV(ctx, kubeClient, restoreContext, log)
+			curLog.Info("SnapshotRestore CR completes, rebind restored PV")
+
+			err := rebindRestorePV(ctx, restore, kubeClient, restoreContext, curLog)
 			if err != nil {
 				restoreContext.completeStatus = util.DataMoveFailed
 				restoreContext.completeMsg = err.Error()
-				log.WithError(err).WithFields(logrus.Fields{
-					"restore PVC":     restoreContext.restorePVC.Name,
-					"target PVC":      restoreContext.targetPVC.Name,
-					"snapshotRestore": restoreContext.snapshotRestore.Name,
-				}).Error("Failed to rebind restore PV")
+				curLog.WithError(err).Error("Failed to rebind restore PV")
 			}
 		}
+
+		util.DeletePVCIfAny(cancelCtx, kubeClient, restoreContext.restorePVC, curLog)
 
 		cancel()
 	}()
 }
 
-func watchSnapshotRestore(ctx context.Context, veleroClient *veleroClientSet.Clientset,
-	restoreContext *snpahotRestoreContext, log logrus.FieldLogger) {
+func watchSnapshotRestore(ctx context.Context, veleroClient *veleroClientSet.Clientset, restoreContext *snpahotRestoreContext, log logrus.FieldLogger) {
+	log.Info("start to watch snapshotrestore")
 
 	checkFunc := func(ctx context.Context) (bool, error) {
 		updated, err := veleroClient.VeleroV1().SnapshotRestores(restoreContext.snapshotRestore.Namespace).Get(ctx, restoreContext.snapshotRestore.Name, metav1.GetOptions{})
 		if err != nil {
+			log.Error("Failed to get snapshotrestore")
 			return false, err
 		}
 
 		if updated.Status.Phase == velerov1api.SnapshotRestorePhaseFailed {
-			return false, errors.New("snapshot backup failed")
+			return false, errors.Errorf("snapshot restore failed: %s", updated.Status.Message)
 		}
 
 		if updated.Status.Phase == velerov1api.SnapshotRestorePhaseCompleted {
 			return true, nil
 		}
 
+		log.Info("Snapshotrestore is ongoing")
+
 		return false, nil
 	}
 
 	err := wait.PollWithContext(ctx, time.Millisecond*500, util.GetDataMovementWaitTimeout(), checkFunc)
 	if err != nil {
+		if err == wait.ErrWaitTimeout {
+			log.WithError(err).Error("Timeout to wait SnapshotRestore")
+		} else {
+			log.WithError(err).Error("SnapshotRestore error out")
+		}
+
 		restoreContext.completeStatus = util.DataMoveFailed
 		restoreContext.completeMsg = err.Error()
-		log.WithError(err).Errorf("SnapshotRestore %s failed", restoreContext.snapshotRestore.Name)
 	} else {
 		restoreContext.completeStatus = util.DataMoveCompleted
-		log.Infof("SnapshotRestore %s is completed", restoreContext.snapshotRestore.Name)
+		log.Info("SnapshotRestore is completed")
 	}
 }
 
@@ -348,36 +367,67 @@ func getSnapshotBackupInfo(ctx context.Context, restore *velerov1api.Restore,
 	return &snapshotBackupList.Items[0], sourceNamespace, nil
 }
 
-func rebindRestorePV(ctx context.Context, kubeClient *kubernetes.Clientset, restoreContext *snpahotRestoreContext, log logrus.FieldLogger) error {
-	restorePV, err := util.GetPVForPVC(restoreContext.restorePVC, kubeClient.CoreV1())
+func rebindRestorePV(ctx context.Context, restore *velerov1api.Restore,
+	kubeClient *kubernetes.Clientset, restoreContext *snpahotRestoreContext, log logrus.FieldLogger) error {
+	_, restorePV, err := util.WaitPVCBound(ctx, kubeClient.CoreV1(), kubeClient.CoreV1(), restoreContext.restorePVC, util.GetBindWaitTimeout())
 	if err != nil {
 		return errors.Wrapf(err, fmt.Sprintf("Failed to get PV from restore PVC %s", restoreContext.restorePVC.Name))
 	}
 
-	oldPolicy, err := util.SetPVReclaimPolicy(ctx, kubeClient, restorePV, corev1api.PersistentVolumeReclaimRetain)
+	log.WithField("restore PV", restorePV.Name).Info("Restore PV is retrieved")
+
+	retained, err := util.SetPVReclaimPolicy(ctx, kubeClient, restorePV, corev1api.PersistentVolumeReclaimRetain)
 	if err != nil {
 		return errors.Wrapf(err, fmt.Sprintf("Failed to retain PV %s", restorePV.Name))
 	}
 
-	err = util.EnsureDeletePVC(ctx, kubeClient, restoreContext.restorePVC, util.GetBindWaitTimeout(), log)
+	log.WithField("restore PV", restorePV.Name).WithField("retained", (retained != nil)).Info("Restore PV is retained")
+
+	defer func() {
+		if retained != nil {
+			log.WithField("restore PV", restorePV.Name).Info("Rollback PV binding policy")
+
+			_, err := util.SetPVReclaimPolicy(ctx, kubeClient, retained, restorePV.Spec.PersistentVolumeReclaimPolicy)
+			if err != nil {
+				log.WithField("restore PV", restorePV.Name).Error("Failed to rollback PV binding policy")
+			}
+		}
+	}()
+
+	err = util.EnsureDeletePVC(ctx, kubeClient, restoreContext.restorePVC, util.GetBindWaitTimeout())
 	if err != nil {
 		return errors.Wrapf(err, fmt.Sprintf("Failed to delete restore PVC %s", restoreContext.restorePVC.Name))
 	}
 
-	err = util.RebindPV(ctx, kubeClient.CoreV1(), restorePV, restoreContext.targetPVC)
-	if err != nil {
-		return errors.Wrapf(err, fmt.Sprintf("Failed to rebind PV %s to PVC %s", restorePV.Name, restoreContext.targetPVC.Name))
-	}
+	log.WithField("restore PVC", restoreContext.restorePVC.Name).Info("Restore PVC is deleted")
 
-	restorePV, err = util.WaitPVBound(ctx, kubeClient.CoreV1(), restorePV, util.GetBindWaitTimeout())
+	restoreContext.restorePVC = nil
+
+	// err = util.RebindPV(ctx, kubeClient.CoreV1(), retained)
+	// if err != nil {
+	// 	return errors.Wrapf(err, fmt.Sprintf("Failed to rebind PV %s to PVC %s", restorePV.Name, restoreContext.targetPVC.Name))
+	// }
+
+	// log.WithField("restore PV", restorePV.Name).Info("Restore PV is rebound")
+
+	retained, err = util.WaitPVBound(ctx, kubeClient.CoreV1(), restorePV.Name, util.GetBindWaitTimeout())
 	if err != nil {
 		return errors.Wrapf(err, fmt.Sprintf("Failed to wait bound for PV %s", restorePV.Name))
 	}
 
-	_, err = util.SetPVReclaimPolicy(ctx, kubeClient, restorePV, oldPolicy)
-	if err != nil {
-		return errors.Wrapf(err, fmt.Sprintf("Failed to recover recliam policy for PV %s", restorePV.Name))
-	}
+	log.WithField("restore PV", restorePV.Name).Info("Restore PV is bound now")
+
+	//tmpPV := retained
+	retained = nil
+
+	// _, err = util.SetPVReclaimPolicy(ctx, kubeClient, tmpPV, restorePV.Spec.PersistentVolumeReclaimPolicy)
+	// if err != nil {
+	// 	return errors.Wrapf(err, fmt.Sprintf("Failed to recover recliam policy for PV %s", restorePV.Name))
+	// }
 
 	return nil
+}
+
+func getRestorePVName(restore *velerov1api.Restore, restorePVC *corev1api.PersistentVolumeClaim) string {
+	return "pvc-" + string(restorePVC.UID)
 }

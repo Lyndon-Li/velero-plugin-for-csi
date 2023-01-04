@@ -171,22 +171,29 @@ func (p *PVCBackupItemAction) Execute(item runtime.Unstructured, backup *velerov
 	util.AddLabels(&pvc.ObjectMeta, labels)
 
 	additionalItems := []velero.ResourceIdentifier{}
-	if util.IsMovingVolumeSnapshot() {
-		p.Log.Infof("Starting data movement for volumesnapshot %s", fmt.Sprintf("%s/%s", upd.Namespace, upd.Name))
+	if boolptr.IsSetToTrue(backup.Spec.CSISnapshotMoveData) {
+		curLog := p.Log.WithFields(logrus.Fields{
+			"source PVC":      fmt.Sprintf("%s/%s", pvc.Namespace, pvc.Name),
+			"volume snapshot": fmt.Sprintf("%s/%s", upd.Namespace, upd.Name),
+		})
+
+		curLog.Info("Starting data movement backup")
 
 		updated, err := util.WaitVolumeSnapshotReady(context.Background(), snapshotClient, upd, util.GetVolumeSnapshotWaitTimeout(), p.Log)
 		if err != nil {
 			return nil, nil, errors.Wrapf(err, "error wait volume snapshot ready")
 		}
 
-		p.Log.Infof("Volumesnapshot %s is ready", fmt.Sprintf("%s/%s", upd.Namespace, upd.Name))
+		curLog.Info("Volumesnapshot is ready")
 
 		backupContext, err := moveVolumeSnapshot(context.Background(), client, snapshotClient, veleroClient, backup, &pvc, updated, p.Log)
 		if err != nil {
-			p.Log.WithError(err).Errorf("Failed to submit data movement for volumeSnapshot %s", fmt.Sprintf("%s/%s", upd.Namespace, upd.Name))
-			return nil, nil, errors.Wrapf(err, "error creating volume snapshot")
+			curLog.WithError(err).Error("Failed to submit data movement backup")
+			util.DeleteVolumeSnapshotIfAny(context.Background(), snapshotClient, upd, curLog)
+
+			return nil, nil, errors.Wrapf(err, "error creating volume snapshot backup")
 		} else {
-			p.Log.Infof("Data movement for VolumeSnapshot %s is submitted successfully", fmt.Sprintf("%s/%s", upd.Namespace, upd.Name))
+			curLog.Info("Data movement backup is submitted successfully")
 			asyncWatchSnapshotBackup(context.Background(), client, snapshotClient, veleroClient, backupContext, p.Log)
 		}
 	} else {
@@ -249,21 +256,30 @@ func moveVolumeSnapshot(ctx context.Context, kubeClient *kubernetes.Clientset, s
 		return nil, errors.Wrap(err, "error to retain volume snapshot content")
 	}
 
-	log.WithField("vsc name", vsc.Name).WithField("retained", retained).Info("Finished to retain VSC")
+	log.WithField("vsc name", vsc.Name).WithField("retained", (retained != nil)).Info("Finished to retain VSC")
 
-	err = util.EnsureDeleteVS(ctx, snapshotClient, volumeSnapshot, util.GetBindWaitTimeout(), log)
+	defer func() {
+		if err != nil {
+			if retained != nil {
+				util.DeleteVolumeSnapshotContentIfAny(ctx, snapshotClient, retained, log)
+			}
+		}
+	}()
+
+	err = util.EnsureDeleteVS(ctx, snapshotClient, volumeSnapshot, util.GetBindWaitTimeout())
 	if err != nil {
 		return nil, errors.Wrap(err, "error to delete volume snapshot")
 	}
 
 	log.WithField("vs name", volumeSnapshot.Name).Infof("VS is deleted in namespace %s", volumeSnapshot.Namespace)
 
-	err = util.EnsureDeleteVSC(ctx, snapshotClient, vsc, util.GetBindWaitTimeout(), log)
+	err = util.EnsureDeleteVSC(ctx, snapshotClient, vsc, util.GetBindWaitTimeout())
 	if err != nil {
 		return nil, errors.Wrap(err, "error to delete volume snapshot")
 	}
 
 	log.WithField("vsc name", vsc.Name).Infof("VSC is deleted")
+	retained = nil
 
 	backupVS, err := createBackupVS(ctx, snapshotClient, volumeSnapshot, backup, vsc.Name)
 	if err != nil {
@@ -272,10 +288,18 @@ func moveVolumeSnapshot(ctx context.Context, kubeClient *kubernetes.Clientset, s
 
 	log.WithField("vs name", backupVS.Name).Info("Backup VS is created")
 
-	_, err = createBackupVSC(ctx, snapshotClient, vsc, backupVS)
+	defer func() {
+		if err != nil {
+			util.DeleteVolumeSnapshotIfAny(ctx, snapshotClient, backupVS, log)
+		}
+	}()
+
+	backupVSC, err := createBackupVSC(ctx, snapshotClient, vsc, backupVS)
 	if err != nil {
 		return nil, errors.Wrap(err, "error to create backup volume snapshot content")
 	}
+
+	log.WithField("vsc name", backupVSC.Name).Info("Backup VSC is created")
 
 	util.ResetPVCSpec(pvc, backupVS.Name)
 
@@ -285,6 +309,12 @@ func moveVolumeSnapshot(ctx context.Context, kubeClient *kubernetes.Clientset, s
 	}
 
 	log.WithField("pvc name", backupPVC.Name).Info("Backup PVC is created")
+
+	defer func() {
+		if err != nil {
+			util.DeletePVCIfAny(ctx, kubeClient, backupPVC, log)
+		}
+	}()
 
 	snapshotBackup, err := createSnapshotBackup(ctx, backup, veleroClient, sourcePVC, backupPVC)
 	if err != nil {
@@ -297,6 +327,9 @@ func moveVolumeSnapshot(ctx context.Context, kubeClient *kubernetes.Clientset, s
 		if err != nil {
 			util.DeletePVCIfAny(ctx, kubeClient, backupPVC, log)
 			util.DeleteVolumeSnapshotIfAny(ctx, snapshotClient, backupVS, log)
+			if retained != nil {
+				util.DeleteVolumeSnapshotContentIfAny(ctx, snapshotClient, retained, log)
+			}
 		}
 	}()
 
@@ -331,7 +364,7 @@ func newSnapshotBackup(backup *velerov1api.Backup, sourcePVC *corev1api.Persiste
 			},
 		},
 		Spec: velerov1api.SnapshotBackupSpec{
-			Pvc:                   snapshotPVC.Name,
+			BackupPvc:             snapshotPVC.Name,
 			BackupStorageLocation: backup.Spec.StorageLocation,
 			UploaderType:          util.GetUploaderType(),
 			Tags: map[string]string{
@@ -433,26 +466,29 @@ func asyncWatchSnapshotBackup(ctx context.Context, kubeClient *kubernetes.Client
 	backupContext *snpahotBackupContext, log logrus.FieldLogger) {
 	cancelCtx, cancel := context.WithCancel(ctx)
 	backupContext.cancelRoutine = cancel
+	curLog := log.WithFields(logrus.Fields{
+		"snapshot PVC":    backupContext.snapshotPVC.Name,
+		"snapshot backup": backupContext.snapshotBackup.Name,
+		"volume snapshot": backupContext.volumeSnapshot.Name,
+	})
 
 	go func() {
-		watchSnapshotBackup(cancelCtx, veleroClient, backupContext, log)
-		util.DeletePVCIfAny(cancelCtx, kubeClient, backupContext.snapshotPVC, log)
-		util.DeleteVolumeSnapshotIfAny(cancelCtx, snapshotClient, backupContext.volumeSnapshot, log)
+		watchSnapshotBackup(cancelCtx, veleroClient, backupContext, curLog)
+		util.DeletePVCIfAny(cancelCtx, kubeClient, backupContext.snapshotPVC, curLog)
+		util.DeleteVolumeSnapshotIfAny(cancelCtx, snapshotClient, backupContext.volumeSnapshot, curLog)
 		cancel()
 	}()
 }
 
 func watchSnapshotBackup(ctx context.Context, veleroClient *veleroClientSet.Clientset, backupContext *snpahotBackupContext, log logrus.FieldLogger) {
-	watchLog := log.WithField("name", backupContext.snapshotBackup.Name)
-
-	watchLog.Info("start to watch snapshotbackup")
+	log.Info("start to watch snapshotbackup")
 
 	// panicCount := 0
 
 	checkFunc := func(ctx context.Context) (bool, error) {
 		updated, err := veleroClient.VeleroV1().SnapshotBackups(backupContext.snapshotBackup.Namespace).Get(ctx, backupContext.snapshotBackup.Name, metav1.GetOptions{})
 		if err != nil {
-			watchLog.Error("Failed to get snapshotbackup")
+			log.Error("Failed to get snapshotbackup")
 			return false, err
 		}
 
@@ -464,7 +500,7 @@ func watchSnapshotBackup(ctx context.Context, veleroClient *veleroClientSet.Clie
 			return true, nil
 		}
 
-		watchLog.Info("Snapshotbackup is ongoing")
+		log.Info("Snapshotbackup is ongoing")
 		// panicCount++
 		// if panicCount == 30 {
 		// 	panic(errors.New("panic count reach"))
@@ -476,9 +512,9 @@ func watchSnapshotBackup(ctx context.Context, veleroClient *veleroClientSet.Clie
 	err := wait.PollWithContext(ctx, 5*time.Second, util.GetDataMovementWaitTimeout(), checkFunc)
 	if err != nil {
 		if err == wait.ErrWaitTimeout {
-			watchLog.WithError(err).Error("Timeout to wait SnapshotBackup")
+			log.WithError(err).Error("Timeout to wait SnapshotBackup")
 		} else {
-			watchLog.WithError(err).Error("SnapshotBackup error out")
+			log.WithError(err).Error("SnapshotBackup error out")
 		}
 
 		backupContext.completeStatus = util.DataMoveFailed
@@ -486,6 +522,6 @@ func watchSnapshotBackup(ctx context.Context, veleroClient *veleroClientSet.Clie
 
 	} else {
 		backupContext.completeStatus = util.DataMoveCompleted
-		watchLog.Info("SnapshotBackup is completed")
+		log.Info("SnapshotBackup is completed")
 	}
 }
