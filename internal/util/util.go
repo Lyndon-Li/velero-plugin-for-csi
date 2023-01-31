@@ -18,16 +18,13 @@ package util
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 
-	jsonpatch "github.com/evanphx/json-patch"
 	snapshotv1api "github.com/kubernetes-csi/external-snapshotter/client/v4/apis/volumesnapshot/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/sync/errgroup"
 
 	snapshotterClientSet "github.com/kubernetes-csi/external-snapshotter/client/v4/clientset/versioned"
 	snapshotter "github.com/kubernetes-csi/external-snapshotter/client/v4/clientset/versioned/typed/volumesnapshot/v1"
@@ -44,21 +41,7 @@ import (
 	veleroClientSet "github.com/vmware-tanzu/velero/pkg/generated/clientset/versioned"
 	"github.com/vmware-tanzu/velero/pkg/label"
 	"github.com/vmware-tanzu/velero/pkg/podvolume"
-	"github.com/vmware-tanzu/velero/pkg/util/boolptr"
-
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-)
-
-const (
-	KubeAnnBindCompleted     = "pv.kubernetes.io/bind-completed"
-	KubeAnnBoundByController = "pv.kubernetes.io/bound-by-controller"
-)
-
-type DataMoveCompletionStatus string
-
-const (
-	DataMoveCompleted DataMoveCompletionStatus = "Completed"
-	DataMoveFailed    DataMoveCompletionStatus = "Failed"
 )
 
 func GetPVForPVC(pvc *corev1api.PersistentVolumeClaim, corev1 corev1client.PersistentVolumesGetter) (*corev1api.PersistentVolume, error) {
@@ -324,227 +307,6 @@ func HasBackupLabel(o *metav1.ObjectMeta, backupName string) bool {
 	return o.Labels[velerov1api.BackupNameLabel] == label.GetValidName(backupName)
 }
 
-func GetVolumeSnapshotWaitTimeout() time.Duration {
-	defaultCSISnapshotTimeout := 10 * time.Minute
-	return defaultCSISnapshotTimeout
-}
-
-func GetDataMovementWaitTimeout() time.Duration {
-	defaultDataMovementTimeout := 10 * time.Minute
-	return defaultDataMovementTimeout
-}
-
-func GetBindWaitTimeout() time.Duration {
-	defaultBindTimeout := 1 * time.Minute
-	return defaultBindTimeout
-}
-
-func GetUploaderType() string {
-	return "kopia"
-}
-
-func WaitVolumeSnapshotReady(ctx context.Context, snapshotClient *snapshotterClientSet.Clientset,
-	volumeSnapshot *snapshotv1api.VolumeSnapshot, timeout time.Duration, Log logrus.FieldLogger) (*snapshotv1api.VolumeSnapshot, error) {
-	eg, _ := errgroup.WithContext(ctx)
-	interval := 5 * time.Second
-
-	var updated *snapshotv1api.VolumeSnapshot
-	eg.Go(func() error {
-		err := wait.PollImmediate(interval, timeout, func() (bool, error) {
-			tmpVS, err := snapshotClient.SnapshotV1().VolumeSnapshots(volumeSnapshot.Namespace).Get(ctx, volumeSnapshot.Name, metav1.GetOptions{})
-			if err != nil {
-				return false, errors.Wrapf(err, fmt.Sprintf("failed to get volumesnapshot %s/%s", volumeSnapshot.Namespace, volumeSnapshot.Name))
-			}
-			if tmpVS.Status == nil || tmpVS.Status.BoundVolumeSnapshotContentName == nil || !boolptr.IsSetToTrue(tmpVS.Status.ReadyToUse) || tmpVS.Status.RestoreSize == nil {
-				Log.Infof("Waiting for CSI driver to reconcile volumesnapshot %s/%s. Retrying in %ds", volumeSnapshot.Namespace, volumeSnapshot.Name, interval/time.Second)
-				return false, nil
-			}
-
-			updated = tmpVS
-			Log.Debugf("VolumeSnapshot %s/%s turned into ReadyToUse.", volumeSnapshot.Namespace, volumeSnapshot.Name)
-
-			return true, nil
-		})
-
-		return err
-	})
-
-	err := eg.Wait()
-
-	return updated, err
-}
-
-func DeletePVCIfAny(ctx context.Context, kubeClient *kubernetes.Clientset, pvc *corev1api.PersistentVolumeClaim, log logrus.FieldLogger) {
-	if pvc != nil {
-		err := kubeClient.CoreV1().PersistentVolumeClaims(pvc.Namespace).Delete(ctx, pvc.Name, *&metav1.DeleteOptions{})
-		if err != nil {
-			log.WithError(err).Errorf("Failed to delete pvc %s", pvc.Name)
-		}
-	}
-}
-
-func DeleteVolumeSnapshotIfAny(ctx context.Context, snapshotClient *snapshotterClientSet.Clientset, volumeSnapshot *snapshotv1api.VolumeSnapshot, log logrus.FieldLogger) {
-	if volumeSnapshot != nil {
-		err := snapshotClient.SnapshotV1().VolumeSnapshots(volumeSnapshot.Namespace).Delete(ctx, volumeSnapshot.Name, *&metav1.DeleteOptions{})
-		if err != nil {
-			log.WithError(err).Errorf("Failed to delete volume snapshot %s", volumeSnapshot.Name)
-		}
-	}
-}
-
-func DeleteVolumeSnapshotContentIfAny(ctx context.Context, snapshotClient *snapshotterClientSet.Clientset,
-	vsc *snapshotv1api.VolumeSnapshotContent, log logrus.FieldLogger) {
-	if vsc != nil {
-		err := snapshotClient.SnapshotV1().VolumeSnapshotContents().Delete(ctx, vsc.Name, *&metav1.DeleteOptions{})
-		if err != nil {
-			log.WithError(err).Errorf("Failed to delete volume snapshot content %s", vsc.Name)
-		}
-	}
-}
-
-func DeletePVIfAny(ctx context.Context, kubeClient *kubernetes.Clientset,
-	pv *corev1api.PersistentVolume, log logrus.FieldLogger) {
-	if pv != nil {
-		err := kubeClient.CoreV1().PersistentVolumes().Delete(ctx, pv.Name, *&metav1.DeleteOptions{})
-		if err != nil {
-			log.WithError(err).Errorf("Failed to delete volume snapshot content %s", pv.Name)
-		}
-	}
-}
-
-func GetVolumeModeFromBackup(backup *velerov1api.Backup) corev1api.PersistentVolumeMode {
-	return corev1api.PersistentVolumeFilesystem
-}
-
-func GetVolumeModeFromRestore(backup *velerov1api.Restore) corev1api.PersistentVolumeMode {
-	return corev1api.PersistentVolumeFilesystem
-}
-
-func WaitPVCBound(ctx context.Context, pvcGetter corev1client.PersistentVolumeClaimsGetter,
-	pvGetter corev1client.PersistentVolumesGetter, pvc *corev1api.PersistentVolumeClaim,
-	timeout time.Duration) (*corev1api.PersistentVolumeClaim, *corev1api.PersistentVolume, error) {
-	eg, _ := errgroup.WithContext(ctx)
-	interval := 5 * time.Second
-
-	var updated *corev1api.PersistentVolumeClaim
-	eg.Go(func() error {
-		err := wait.PollImmediate(interval, timeout, func() (bool, error) {
-			tmpPVC, err := pvcGetter.PersistentVolumeClaims(pvc.Namespace).Get(ctx, pvc.Name, metav1.GetOptions{})
-			if err != nil {
-				return false, errors.Wrapf(err, fmt.Sprintf("failed to get pvc %s/%s", pvc.Namespace, pvc.Name))
-			}
-
-			if tmpPVC.Spec.VolumeName == "" {
-				return false, nil
-			}
-
-			updated = tmpPVC
-
-			return true, nil
-		})
-
-		return err
-	})
-
-	err := eg.Wait()
-	if err != nil {
-		return nil, nil, err
-	}
-
-	pv, err := pvGetter.PersistentVolumes().Get(ctx, updated.Spec.VolumeName, metav1.GetOptions{})
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return updated, pv, err
-}
-
-func WaitPVBound(ctx context.Context, pvGetter corev1client.PersistentVolumesGetter,
-	pvName string, timeout time.Duration) (*corev1api.PersistentVolume, error) {
-	eg, _ := errgroup.WithContext(ctx)
-	interval := 5 * time.Second
-
-	var updated *corev1api.PersistentVolume
-	eg.Go(func() error {
-		err := wait.PollImmediate(interval, timeout, func() (bool, error) {
-			tmpPV, err := pvGetter.PersistentVolumes().Get(ctx, pvName, metav1.GetOptions{})
-			if err != nil {
-				return false, errors.Wrapf(err, fmt.Sprintf("failed to get pv %s", pvName))
-			}
-
-			if tmpPV.Spec.ClaimRef == nil {
-				return false, nil
-			}
-
-			updated = tmpPV
-
-			return true, nil
-		})
-
-		return err
-	})
-
-	err := eg.Wait()
-	if err != nil {
-		return nil, err
-	}
-
-	return updated, err
-}
-
-func RebindPV(ctx context.Context, pvGetter corev1client.PersistentVolumesGetter, pv *corev1api.PersistentVolume) error {
-	updated := pv.DeepCopy()
-	delete(updated.Annotations, KubeAnnBindCompleted)
-	delete(updated.Annotations, KubeAnnBoundByController)
-	pv.Spec.ClaimRef = nil
-
-	var patchData []byte
-	patchData, err := json.Marshal(updated)
-	if err != nil {
-		return err
-	}
-
-	_, err = pvGetter.PersistentVolumes().Patch(ctx, pv.Name, types.MergePatchType, patchData, metav1.PatchOptions{})
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func WaitPVCBindLost(ctx context.Context, pvcGetter corev1client.PersistentVolumeClaimsGetter,
-	pvc *corev1api.PersistentVolumeClaim, timeout time.Duration) (*corev1api.PersistentVolumeClaim, error) {
-	eg, _ := errgroup.WithContext(ctx)
-	interval := 5 * time.Second
-
-	var updated *corev1api.PersistentVolumeClaim
-	eg.Go(func() error {
-		err := wait.PollImmediate(interval, timeout, func() (bool, error) {
-			tmpPVC, err := pvcGetter.PersistentVolumeClaims(pvc.Namespace).Get(ctx, pvc.Name, metav1.GetOptions{})
-			if err != nil {
-				return false, errors.Wrapf(err, fmt.Sprintf("failed to get pvc %s/%s", pvc.Namespace, pvc.Name))
-			}
-
-			if tmpPVC.Status.Phase != corev1api.ClaimLost {
-				return false, nil
-			}
-
-			updated = tmpPVC
-
-			return true, nil
-		})
-
-		return err
-	})
-
-	err := eg.Wait()
-	if err != nil {
-		return nil, err
-	}
-
-	return updated, err
-}
-
 func SetPVCStorageResourceRequest(pvc *corev1api.PersistentVolumeClaim, restoreSize resource.Quantity, log logrus.FieldLogger) {
 	{
 		if pvc.Spec.Resources.Requests == nil {
@@ -573,192 +335,18 @@ func ResetPVCSpec(pvc *corev1api.PersistentVolumeClaim, vsName string) {
 	pvc.Spec.DataSourceRef = dataSourceRef
 }
 
-func RetainVSC(ctx context.Context, snapshotClient *snapshotterClientSet.Clientset,
-	vsc *snapshotv1api.VolumeSnapshotContent) (*snapshotv1api.VolumeSnapshotContent, error) {
-	if vsc.Spec.DeletionPolicy == snapshotv1api.VolumeSnapshotContentRetain {
-		return nil, nil
-	}
-	origBytes, err := json.Marshal(vsc)
+func DeleteVolumeSnapshotIfAny(ctx context.Context, snapshotClient *snapshotterClientSet.Clientset, vsName string, vsNamespace string, log logrus.FieldLogger) {
+	vs, err := snapshotClient.SnapshotV1().VolumeSnapshots(vsNamespace).Get(ctx, vsName, metav1.GetOptions{})
 	if err != nil {
-		return nil, errors.Wrap(err, "error marshalling original VSC")
-	}
-
-	updated := vsc.DeepCopy()
-	updated.Spec.DeletionPolicy = snapshotv1api.VolumeSnapshotContentRetain
-
-	updatedBytes, err := json.Marshal(updated)
-	if err != nil {
-		return nil, errors.Wrap(err, "error marshalling updated VSC")
-	}
-
-	patchBytes, err := jsonpatch.CreateMergePatch(origBytes, updatedBytes)
-	if err != nil {
-		return nil, errors.Wrap(err, "error creating json merge patch for VSC")
-	}
-
-	retained, err := snapshotClient.SnapshotV1().VolumeSnapshotContents().Patch(ctx, vsc.Name, types.MergePatchType, patchBytes, metav1.PatchOptions{})
-	if err != nil {
-		return nil, err
-	}
-
-	return retained, nil
-}
-
-func RetainPV(ctx context.Context, kubeClient *kubernetes.Clientset, pv *corev1api.PersistentVolume) (*corev1api.PersistentVolume, error) {
-	if pv.Spec.PersistentVolumeReclaimPolicy == corev1api.PersistentVolumeReclaimRetain {
-		return nil, nil
-	}
-
-	origBytes, err := json.Marshal(pv)
-	if err != nil {
-		return nil, errors.Wrap(err, "error marshalling original PV")
-	}
-
-	updated := pv.DeepCopy()
-	updated.Spec.PersistentVolumeReclaimPolicy = corev1api.PersistentVolumeReclaimRetain
-
-	updatedBytes, err := json.Marshal(updated)
-	if err != nil {
-		return nil, errors.Wrap(err, "error marshalling updated PV")
-	}
-
-	patchBytes, err := jsonpatch.CreateMergePatch(origBytes, updatedBytes)
-	if err != nil {
-		return nil, errors.Wrap(err, "error creating json merge patch for PV")
-	}
-
-	updated, err = kubeClient.CoreV1().PersistentVolumes().Patch(ctx, pv.Name, types.MergePatchType, patchBytes, metav1.PatchOptions{})
-	if err != nil {
-		return nil, err
-	}
-
-	return updated, nil
-}
-
-func EnsureDeleteVS(ctx context.Context, snapshotClient *snapshotterClientSet.Clientset,
-	vs *snapshotv1api.VolumeSnapshot, timeout time.Duration) error {
-	if vs == nil {
-		return nil
-	}
-
-	err := snapshotClient.SnapshotV1().VolumeSnapshots(vs.Namespace).Delete(ctx, vs.Name, metav1.DeleteOptions{})
-	if err != nil {
-		return errors.Wrap(err, "error to delete volume snapshot")
-	}
-
-	interval := 1 * time.Second
-	err = wait.PollImmediate(interval, timeout, func() (bool, error) {
-		_, err := snapshotClient.SnapshotV1().VolumeSnapshots(vs.Namespace).Get(ctx, vs.Name, metav1.GetOptions{})
-		if err != nil {
-			if apierrors.IsNotFound(err) {
-				return true, nil
-			}
-
-			return false, errors.Wrapf(err, fmt.Sprintf("failed to get VolumeSnapshot %s", vs.Name))
+		if !apierrors.IsNotFound(err) {
+			log.WithError(err).Errorf("Failed to get volume snapshot %s/%s", vsNamespace, vsName)
 		}
 
-		return false, nil
-	})
+		return
+	}
 
+	err = snapshotClient.SnapshotV1().VolumeSnapshots(vs.Namespace).Delete(ctx, vs.Name, *&metav1.DeleteOptions{})
 	if err != nil {
-		return errors.Wrapf(err, "fail to retrieve VolumeSnapshot info for %s", vs.Name)
+		log.WithError(err).Errorf("Failed to delete volume snapshot %s/%s", vs.Namespace, vs.Name)
 	}
-
-	return nil
-}
-
-func EnsureDeleteVSC(ctx context.Context, snapshotClient *snapshotterClientSet.Clientset,
-	vsc *snapshotv1api.VolumeSnapshotContent, timeout time.Duration) error {
-	if vsc == nil {
-		return nil
-	}
-
-	err := snapshotClient.SnapshotV1().VolumeSnapshotContents().Delete(ctx, vsc.Name, metav1.DeleteOptions{})
-	if err != nil {
-		return errors.Wrap(err, "error to delete volume snapshotContent")
-	}
-
-	interval := 1 * time.Second
-	err = wait.PollImmediate(interval, timeout, func() (bool, error) {
-		_, err := snapshotClient.SnapshotV1().VolumeSnapshotContents().Get(ctx, vsc.Name, metav1.GetOptions{})
-		if err != nil {
-			if apierrors.IsNotFound(err) {
-				return true, nil
-			}
-
-			return false, errors.Wrapf(err, fmt.Sprintf("failed to get VolumeSnapshotContent %s", vsc.Name))
-		}
-
-		return false, nil
-	})
-
-	if err != nil {
-		return errors.Wrapf(err, "fail to retrieve VolumeSnapshotContent info for %s", vsc.Name)
-	}
-
-	return nil
-}
-
-func EnsureDeletePVC(ctx context.Context, kubeClient *kubernetes.Clientset,
-	pvc *corev1api.PersistentVolumeClaim, timeout time.Duration) error {
-	if pvc == nil {
-		return nil
-	}
-
-	err := kubeClient.CoreV1().PersistentVolumeClaims(pvc.Namespace).Delete(ctx, pvc.Name, metav1.DeleteOptions{})
-	if err != nil {
-		return errors.Wrap(err, "error to delete pvc")
-	}
-
-	interval := 1 * time.Second
-	err = wait.PollImmediate(interval, timeout, func() (bool, error) {
-		_, err := kubeClient.CoreV1().PersistentVolumeClaims(pvc.Namespace).Get(ctx, pvc.Name, metav1.GetOptions{})
-		if err != nil {
-			if apierrors.IsNotFound(err) {
-				return true, nil
-			}
-
-			return false, errors.Wrapf(err, fmt.Sprintf("failed to get pvc %s", pvc.Name))
-		}
-
-		return false, nil
-	})
-
-	if err != nil {
-		return errors.Wrapf(err, "fail to retrieve pvc info for %s", pvc.Name)
-	}
-
-	return nil
-}
-
-func EnsureDeletePV(ctx context.Context, kubeClient *kubernetes.Clientset,
-	pv *corev1api.PersistentVolume, timeout time.Duration) error {
-	if pv == nil {
-		return nil
-	}
-
-	err := kubeClient.CoreV1().PersistentVolumes().Delete(ctx, pv.Name, metav1.DeleteOptions{})
-	if err != nil {
-		return errors.Wrap(err, "error to delete pvc")
-	}
-
-	interval := 1 * time.Second
-	err = wait.PollImmediate(interval, timeout, func() (bool, error) {
-		_, err := kubeClient.CoreV1().PersistentVolumes().Get(ctx, pv.Name, metav1.GetOptions{})
-		if err != nil {
-			if apierrors.IsNotFound(err) {
-				return true, nil
-			}
-
-			return false, errors.Wrapf(err, fmt.Sprintf("failed to get pvc %s", pv.Name))
-		}
-
-		return false, nil
-	})
-
-	if err != nil {
-		return errors.Wrapf(err, "fail to retrieve pvc info for %s", pv.Name)
-	}
-
-	return nil
 }
