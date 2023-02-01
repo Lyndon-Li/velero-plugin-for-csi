@@ -203,12 +203,12 @@ func newSnapshotRestore(restore *velerov1api.Restore, snapshotBackup *velerov1ap
 		},
 		Spec: velerov1api.SnapshotRestoreSpec{
 			TargetVolume: velerov1api.TargetVolumeSpec{
-				PVC:                pvc.Name,
-				PV:                 pvc.Spec.VolumeName,
-				Namespace:          pvc.Namespace,
-				StorageClass:       *pvc.Spec.StorageClassName,
-				Resources:          pvc.Spec.Resources,
-				PVOperationTimeout: snapshotBackup.Spec.CSISnapshot.CSISnapshotTimeout,
+				PVC:              pvc.Name,
+				PV:               pvc.Spec.VolumeName,
+				Namespace:        pvc.Namespace,
+				StorageClass:     *pvc.Spec.StorageClassName,
+				Resources:        pvc.Spec.Resources,
+				OperationTimeout: snapshotBackup.Spec.CSISnapshot.CSISnapshotTimeout,
 			},
 			RestoreName:           restore.Name,
 			BackupName:            snapshotBackup.Spec.BackupName,
