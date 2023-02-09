@@ -216,7 +216,7 @@ func newSnapshotBackup(backup *velerov1api.Backup, vs *snapshotv1api.VolumeSnaps
 		},
 		Spec: velerov1api.SnapshotBackupSpec{
 			SnapshotType: velerov1api.SnapshotTypeCSI,
-			CSISnapshot: velerov1api.CSISnapshotSpec{
+			CSISnapshot: &velerov1api.CSISnapshotSpec{
 				VolumeSnapshot:     vs.Name,
 				StorageClass:       *pvc.Spec.StorageClassName,
 				CSISnapshotTimeout: backup.Spec.CSISnapshotTimeout,

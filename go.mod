@@ -134,4 +134,4 @@ require (
 
 replace github.com/gogo/protobuf => github.com/gogo/protobuf v1.3.2
 
-replace github.com/vmware-tanzu/velero => github.com/Lyndon-Li/velero v0.0.0-20230207032431-e4eaf1a2da66
+replace github.com/vmware-tanzu/velero => github.com/Lyndon-Li/velero v0.0.0-20230209103626-81bf256beace
