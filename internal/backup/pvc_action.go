@@ -150,7 +150,7 @@ func (p *PVCBackupItemAction) Execute(item runtime.Unstructured, backup *velerov
 	util.AddLabels(&pvc.ObjectMeta, labels)
 
 	additionalItems := []velero.ResourceIdentifier{}
-	if boolptr.IsSetToTrue(backup.Spec.CSISnapshotMoveData) {
+	if boolptr.IsSetToTrue(backup.Spec.SnapshotMoveData) {
 		curLog := p.Log.WithFields(logrus.Fields{
 			"source PVC":      fmt.Sprintf("%s/%s", pvc.Namespace, pvc.Name),
 			"volume snapshot": fmt.Sprintf("%s/%s", upd.Namespace, upd.Name),
@@ -217,21 +217,14 @@ func newSnapshotBackup(backup *velerov1api.Backup, vs *snapshotv1api.VolumeSnaps
 		Spec: velerov1api.SnapshotBackupSpec{
 			SnapshotType: velerov1api.SnapshotTypeCSI,
 			CSISnapshot: &velerov1api.CSISnapshotSpec{
-				VolumeSnapshot:     vs.Name,
-				StorageClass:       *pvc.Spec.StorageClassName,
-				CSISnapshotTimeout: backup.Spec.CSISnapshotTimeout,
+				VolumeSnapshot: vs.Name,
+				StorageClass:   *pvc.Spec.StorageClassName,
 			},
-			BackupName:            backup.Name,
 			SourcePVC:             pvc.Name,
 			DataMover:             backup.Spec.DataMover,
 			BackupStorageLocation: backup.Spec.StorageLocation,
 			SourceNamespace:       pvc.Namespace,
-			Tags: map[string]string{
-				"backup":     backup.Name,
-				"backup-uid": string(backup.UID),
-				"ns":         pvc.Namespace,
-				"volume":     pvc.Name,
-			},
+			OperationTimeout:      backup.Spec.CSISnapshotTimeout,
 		},
 	}
 

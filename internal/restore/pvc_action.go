@@ -82,6 +82,10 @@ func (p *PVCRestoreItemAction) Execute(input *velero.RestoreItemActionExecuteInp
 		return nil, errors.WithStack(err)
 	}
 	p.Log.Infof("Starting PVCRestoreItemAction for PVC %s/%s", pvc.Namespace, pvc.Name)
+	if boolptr.IsSetToFalse(input.Restore.Spec.RestorePVs) {
+		p.Log.Infof("Restore did not request for PVs to be restored %s/%s", input.Restore.Namespace, input.Restore.Name)
+		return &velero.RestoreItemActionExecuteOutput{SkipRestore: true}, nil
+	}
 
 	removePVCAnnotations(&pvc,
 		[]string{AnnBindCompleted, AnnBoundByController, AnnStorageProvisioner, AnnBetaStorageProvisioner, AnnSelectedNode})
@@ -97,7 +101,7 @@ func (p *PVCRestoreItemAction) Execute(input *velero.RestoreItemActionExecuteInp
 		return nil, errors.WithStack(err)
 	}
 
-	if boolptr.IsSetToTrue(input.Restore.Spec.CSISnapshotMoveData) {
+	if boolptr.IsSetToTrue(input.Restore.Spec.SnapshotMoveData) {
 		curLog := p.Log.WithField("target PVC", fmt.Sprintf("%s/%s", pvc.Namespace, pvc.Name))
 		curLog.Info("Starting data movement restore")
 
@@ -203,19 +207,17 @@ func newSnapshotRestore(restore *velerov1api.Restore, snapshotBackup *velerov1ap
 		},
 		Spec: velerov1api.SnapshotRestoreSpec{
 			TargetVolume: velerov1api.TargetVolumeSpec{
-				PVC:              pvc.Name,
-				PV:               pvc.Spec.VolumeName,
-				Namespace:        pvc.Namespace,
-				StorageClass:     *pvc.Spec.StorageClassName,
-				Resources:        pvc.Spec.Resources,
-				OperationTimeout: snapshotBackup.Spec.CSISnapshot.CSISnapshotTimeout,
+				PVC:          pvc.Name,
+				PV:           pvc.Spec.VolumeName,
+				Namespace:    pvc.Namespace,
+				StorageClass: *pvc.Spec.StorageClassName,
+				Resources:    pvc.Spec.Resources,
 			},
-			RestoreName:           restore.Name,
-			BackupName:            snapshotBackup.Spec.BackupName,
 			BackupStorageLocation: snapshotBackup.Spec.BackupStorageLocation,
 			DataMover:             snapshotBackup.Spec.DataMover,
 			SnapshotID:            snapshotBackup.Status.SnapshotID,
 			SourceNamespace:       snapshotBackup.Spec.SourceNamespace,
+			OperationTimeout:      snapshotBackup.Spec.OperationTimeout,
 		},
 	}
 
