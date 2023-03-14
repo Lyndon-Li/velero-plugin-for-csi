@@ -86,8 +86,8 @@ func (p *PVCBackupItemAction) Execute(item runtime.Unstructured, backup *velerov
 		return item, nil, "", nil, nil
 	}
 
-	if backup.Status.Phase == velerov1api.BackupPhaseFinalizingAfterPluginOperations ||
-		backup.Status.Phase == velerov1api.BackupPhaseFinalizingAfterPluginOperationsPartiallyFailed {
+	if backup.Status.Phase == velerov1api.BackupPhaseFinalizing ||
+		backup.Status.Phase == velerov1api.BackupPhaseFinalizingPartiallyFailed {
 		p.Log.WithField("Backup", fmt.Sprintf("%s/%s", backup.Namespace, backup.Name)).
 			WithField("Phase", backup.Status.Phase).Info("Backup is in finalizing phase, skip it")
 		return item, nil, "", nil, nil
