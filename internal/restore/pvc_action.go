@@ -294,11 +294,8 @@ func newSnapshotRestore(restore *velerov1api.Restore, backupResult *velerov1api.
 		},
 		Spec: velerov1api.SnapshotRestoreSpec{
 			TargetVolume: velerov1api.TargetVolumeSpec{
-				PVC:          pvc.Name,
-				Namespace:    pvc.Namespace,
-				PVLabel:      pvc.Spec.Selector.MatchLabels[velerov1api.DynamicPVRestoreLabel],
-				StorageClass: *pvc.Spec.StorageClassName,
-				Resources:    pvc.Spec.Resources,
+				PVC:       pvc.Name,
+				Namespace: pvc.Namespace,
 			},
 			BackupStorageLocation: backupResult.BackupStorageLocation,
 			DataMover:             backupResult.DataMover,
