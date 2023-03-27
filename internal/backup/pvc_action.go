@@ -273,8 +273,6 @@ func (p *PVCBackupItemAction) Cancel(operationID string, backup *velerov1api.Bac
 		return err
 	}
 
-	snapshotBackup.Spec.Cancel = true
-
 	return cancelSnapshotBackup(context.Background(), p.VeleroClient, snapshotBackup)
 }
 

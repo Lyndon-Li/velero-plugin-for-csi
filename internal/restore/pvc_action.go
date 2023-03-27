@@ -197,8 +197,6 @@ func (p *PVCRestoreItemAction) Cancel(operationID string, restore *velerov1api.R
 		return err
 	}
 
-	snapshotRestore.Spec.Cancel = true
-
 	return cancelSnapshotRestore(context.Background(), p.VeleroClient, snapshotRestore)
 }
 
