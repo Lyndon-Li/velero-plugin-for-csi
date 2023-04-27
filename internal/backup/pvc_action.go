@@ -37,6 +37,7 @@ import (
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	velerov1alpha1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1alpha1"
 
 	"github.com/vmware-tanzu/velero-plugin-for-csi/internal/util"
 	"github.com/vmware-tanzu/velero/pkg/kuberesource"
@@ -253,9 +254,9 @@ func (p *PVCBackupItemAction) Progress(operationID string, backup *velerov1api.B
 		progress.Updated = snapshotBackup.Status.CompletionTimestamp.Time
 	}
 
-	if snapshotBackup.Status.Phase == velerov1api.SnapshotBackupPhaseCompleted {
+	if snapshotBackup.Status.Phase == velerov1alpha1api.SnapshotBackupPhaseCompleted {
 		progress.Completed = true
-	} else if snapshotBackup.Status.Phase == velerov1api.SnapshotBackupPhaseFailed {
+	} else if snapshotBackup.Status.Phase == velerov1alpha1api.SnapshotBackupPhaseFailed {
 		progress.Completed = true
 		progress.Err = snapshotBackup.Status.Message
 	}
@@ -277,10 +278,10 @@ func (p *PVCBackupItemAction) Cancel(operationID string, backup *velerov1api.Bac
 }
 
 func newSnapshotBackup(backup *velerov1api.Backup, vs *snapshotv1api.VolumeSnapshot,
-	pvc *corev1api.PersistentVolumeClaim, operationId string) *velerov1api.SnapshotBackup {
-	snapshotBackup := &velerov1api.SnapshotBackup{
+	pvc *corev1api.PersistentVolumeClaim, operationId string) *velerov1alpha1api.SnapshotBackup {
+	snapshotBackup := &velerov1alpha1api.SnapshotBackup{
 		TypeMeta: metav1.TypeMeta{
-			APIVersion: velerov1api.SchemeGroupVersion.String(),
+			APIVersion: velerov1alpha1api.SchemeGroupVersion.String(),
 			Kind:       "SnapshotBackup",
 		},
 		ObjectMeta: metav1.ObjectMeta{
@@ -302,9 +303,9 @@ func newSnapshotBackup(backup *velerov1api.Backup, vs *snapshotv1api.VolumeSnaps
 				velerov1api.AsyncOperationIdLabel: operationId,
 			},
 		},
-		Spec: velerov1api.SnapshotBackupSpec{
-			SnapshotType: velerov1api.SnapshotTypeCSI,
-			CSISnapshot: &velerov1api.CSISnapshotSpec{
+		Spec: velerov1alpha1api.SnapshotBackupSpec{
+			SnapshotType: velerov1alpha1api.SnapshotTypeCSI,
+			CSISnapshot: &velerov1alpha1api.CSISnapshotSpec{
 				VolumeSnapshot: vs.Name,
 				StorageClass:   *pvc.Spec.StorageClassName,
 			},
@@ -320,10 +321,10 @@ func newSnapshotBackup(backup *velerov1api.Backup, vs *snapshotv1api.VolumeSnaps
 }
 
 func createSnapshotBackup(ctx context.Context, backup *velerov1api.Backup, veleroClient *veleroClientSet.Clientset,
-	vs *snapshotv1api.VolumeSnapshot, pvc *corev1api.PersistentVolumeClaim, operationId string) (*velerov1api.SnapshotBackup, error) {
+	vs *snapshotv1api.VolumeSnapshot, pvc *corev1api.PersistentVolumeClaim, operationId string) (*velerov1alpha1api.SnapshotBackup, error) {
 	snapshotBackup := newSnapshotBackup(backup, vs, pvc, operationId)
 
-	snapshotBackup, err := veleroClient.VeleroV1().SnapshotBackups(snapshotBackup.Namespace).Create(ctx, snapshotBackup, metav1.CreateOptions{})
+	snapshotBackup, err := veleroClient.VeleroV1alpha1().SnapshotBackups(snapshotBackup.Namespace).Create(ctx, snapshotBackup, metav1.CreateOptions{})
 	if err != nil {
 		return nil, errors.Wrap(err, "error to create SnapshotBackup CR")
 	}
@@ -331,10 +332,10 @@ func createSnapshotBackup(ctx context.Context, backup *velerov1api.Backup, veler
 	return snapshotBackup, nil
 }
 
-func getSnapshotBackup(ctx context.Context, backup *velerov1api.Backup, veleroClient *veleroClientSet.Clientset, operationID string) (*velerov1api.SnapshotBackup, error) {
+func getSnapshotBackup(ctx context.Context, backup *velerov1api.Backup, veleroClient *veleroClientSet.Clientset, operationID string) (*velerov1alpha1api.SnapshotBackup, error) {
 	listOptions := metav1.ListOptions{LabelSelector: fmt.Sprintf("%s=%s", velerov1api.AsyncOperationIdLabel, operationID)}
 
-	snapshotBackupList, err := veleroClient.VeleroV1().SnapshotBackups(backup.Namespace).List(context.Background(), listOptions)
+	snapshotBackupList, err := veleroClient.VeleroV1alpha1().SnapshotBackups(backup.Namespace).List(context.Background(), listOptions)
 	if err != nil {
 		return nil, errors.Wrap(err, "error to list SnapshotBackup")
 	}
@@ -350,7 +351,7 @@ func getSnapshotBackup(ctx context.Context, backup *velerov1api.Backup, veleroCl
 	return &snapshotBackupList.Items[0], nil
 }
 
-func cancelSnapshotBackup(ctx context.Context, veleroClient *veleroClientSet.Clientset, ssb *velerov1api.SnapshotBackup) error {
+func cancelSnapshotBackup(ctx context.Context, veleroClient *veleroClientSet.Clientset, ssb *velerov1alpha1api.SnapshotBackup) error {
 	oldData, err := json.Marshal(ssb)
 	if err != nil {
 		return errors.Wrap(err, "error marshalling original SnapshotBackup")
@@ -369,7 +370,7 @@ func cancelSnapshotBackup(ctx context.Context, veleroClient *veleroClientSet.Cli
 		return errors.Wrap(err, "error creating json merge patch for SnapshotBackup")
 	}
 
-	_, err = veleroClient.VeleroV1().SnapshotBackups(ssb.Namespace).Patch(ctx, ssb.Name, types.MergePatchType, patchData, metav1.PatchOptions{})
+	_, err = veleroClient.VeleroV1alpha1().SnapshotBackups(ssb.Namespace).Patch(ctx, ssb.Name, types.MergePatchType, patchData, metav1.PatchOptions{})
 	if err != nil {
 		return err
 	}

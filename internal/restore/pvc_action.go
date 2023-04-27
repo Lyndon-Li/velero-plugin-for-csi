@@ -39,6 +39,7 @@ import (
 	"github.com/vmware-tanzu/velero/pkg/util/boolptr"
 
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	velerov1alpha1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1alpha1"
 
 	snapshotterClientSet "github.com/kubernetes-csi/external-snapshotter/client/v4/clientset/versioned"
 	veleroClientSet "github.com/vmware-tanzu/velero/pkg/generated/clientset/versioned"
@@ -177,9 +178,9 @@ func (p *PVCRestoreItemAction) Progress(operationID string, restore *velerov1api
 		progress.Updated = snapshotRestore.Status.CompletionTimestamp.Time
 	}
 
-	if snapshotRestore.Status.Phase == velerov1api.SnapshotRestorePhaseCompleted {
+	if snapshotRestore.Status.Phase == velerov1alpha1api.SnapshotRestorePhaseCompleted {
 		progress.Completed = true
-	} else if snapshotRestore.Status.Phase == velerov1api.SnapshotRestorePhaseFailed {
+	} else if snapshotRestore.Status.Phase == velerov1alpha1api.SnapshotRestorePhaseFailed {
 		progress.Completed = true
 		progress.Err = snapshotRestore.Status.Message
 	}
@@ -237,7 +238,7 @@ func restoreFromVolumeSnapshot(pvc *corev1api.PersistentVolumeClaim, snapClient 
 }
 
 func restoreFromDataMovement(ctx context.Context, veleroClient *veleroClientSet.Clientset, kubeClient *kubernetes.Clientset,
-	restore *velerov1api.Restore, pvc *corev1api.PersistentVolumeClaim, operationId string, log logrus.FieldLogger) (*velerov1api.SnapshotRestore, error) {
+	restore *velerov1api.Restore, pvc *corev1api.PersistentVolumeClaim, operationId string, log logrus.FieldLogger) (*velerov1alpha1api.SnapshotRestore, error) {
 	backupResult, err := getSnapshotBackupResult(ctx, restore, kubeClient)
 	if err != nil {
 		return nil, errors.Wrapf(err, "error to get backup info for restore %s", restore.Name)
@@ -255,7 +256,7 @@ func restoreFromDataMovement(ctx context.Context, veleroClient *veleroClientSet.
 	pvc.Spec.Selector.MatchLabels[velerov1api.DynamicPVRestoreLabel] = label.GetValidName(fmt.Sprintf("%s.%s", pvc.Namespace, pvc.Name))
 
 	snapshotRestore := newSnapshotRestore(restore, backupResult, pvc, operationId)
-	snapshotRestore, err = veleroClient.VeleroV1().SnapshotRestores(snapshotRestore.Namespace).Create(ctx, snapshotRestore, metav1.CreateOptions{})
+	snapshotRestore, err = veleroClient.VeleroV1alpha1().SnapshotRestores(snapshotRestore.Namespace).Create(ctx, snapshotRestore, metav1.CreateOptions{})
 	if err != nil {
 		return nil, errors.Wrap(err, "error to create SnapshotRestore CR")
 	}
@@ -265,11 +266,11 @@ func restoreFromDataMovement(ctx context.Context, veleroClient *veleroClientSet.
 	return snapshotRestore, nil
 }
 
-func newSnapshotRestore(restore *velerov1api.Restore, backupResult *velerov1api.SnapshotBackupResult,
-	pvc *corev1api.PersistentVolumeClaim, operationId string) *velerov1api.SnapshotRestore {
-	snapshotRestore := &velerov1api.SnapshotRestore{
+func newSnapshotRestore(restore *velerov1api.Restore, backupResult *velerov1alpha1api.SnapshotBackupResult,
+	pvc *corev1api.PersistentVolumeClaim, operationId string) *velerov1alpha1api.SnapshotRestore {
+	snapshotRestore := &velerov1alpha1api.SnapshotRestore{
 		TypeMeta: metav1.TypeMeta{
-			APIVersion: velerov1api.SchemeGroupVersion.String(),
+			APIVersion: velerov1alpha1api.SchemeGroupVersion.String(),
 			Kind:       "SnapshotRestore",
 		},
 		ObjectMeta: metav1.ObjectMeta{
@@ -290,8 +291,8 @@ func newSnapshotRestore(restore *velerov1api.Restore, backupResult *velerov1api.
 				velerov1api.AsyncOperationIdLabel: operationId,
 			},
 		},
-		Spec: velerov1api.SnapshotRestoreSpec{
-			TargetVolume: velerov1api.TargetVolumeSpec{
+		Spec: velerov1alpha1api.SnapshotRestoreSpec{
+			TargetVolume: velerov1alpha1api.TargetVolumeSpec{
 				PVC:       pvc.Name,
 				Namespace: pvc.Namespace,
 			},
@@ -307,7 +308,7 @@ func newSnapshotRestore(restore *velerov1api.Restore, backupResult *velerov1api.
 }
 
 func getSnapshotBackupResult(ctx context.Context, restore *velerov1api.Restore,
-	kubeClient *kubernetes.Clientset) (*velerov1api.SnapshotBackupResult, error) {
+	kubeClient *kubernetes.Clientset) (*velerov1alpha1api.SnapshotBackupResult, error) {
 	cmList, err := kubeClient.CoreV1().ConfigMaps(restore.Namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: fmt.Sprintf("%s=%s", velerov1api.BackupNameLabel, label.GetValidName(restore.Spec.BackupName)),
 	})
@@ -334,7 +335,7 @@ func getSnapshotBackupResult(ctx context.Context, restore *velerov1api.Restore,
 		return nil, errors.Errorf("no snapshot backup result found with restore key %s, restore %s", string(restore.UID), restore.Name)
 	}
 
-	result := velerov1api.SnapshotBackupResult{}
+	result := velerov1alpha1api.SnapshotBackupResult{}
 	err = json.Unmarshal([]byte(jsonBytes), &result)
 	if err != nil {
 		return nil, errors.Errorf("error to unmarshal backup result, restore UID %s, restore name %s", string(restore.UID), restore.Name)
@@ -343,10 +344,10 @@ func getSnapshotBackupResult(ctx context.Context, restore *velerov1api.Restore,
 	return &result, nil
 }
 
-func getSnapshotRestore(ctx context.Context, restore *velerov1api.Restore, veleroClient *veleroClientSet.Clientset, operationID string) (*velerov1api.SnapshotRestore, error) {
+func getSnapshotRestore(ctx context.Context, restore *velerov1api.Restore, veleroClient *veleroClientSet.Clientset, operationID string) (*velerov1alpha1api.SnapshotRestore, error) {
 	listOptions := metav1.ListOptions{LabelSelector: fmt.Sprintf("%s=%s", velerov1api.AsyncOperationIdLabel, operationID)}
 
-	snapshotRestoreList, err := veleroClient.VeleroV1().SnapshotRestores(restore.Namespace).List(context.Background(), listOptions)
+	snapshotRestoreList, err := veleroClient.VeleroV1alpha1().SnapshotRestores(restore.Namespace).List(context.Background(), listOptions)
 	if err != nil {
 		return nil, errors.Wrap(err, "error to list SnapshotRestore")
 	}
@@ -362,7 +363,7 @@ func getSnapshotRestore(ctx context.Context, restore *velerov1api.Restore, veler
 	return &snapshotRestoreList.Items[0], nil
 }
 
-func cancelSnapshotRestore(ctx context.Context, veleroClient *veleroClientSet.Clientset, ssr *velerov1api.SnapshotRestore) error {
+func cancelSnapshotRestore(ctx context.Context, veleroClient *veleroClientSet.Clientset, ssr *velerov1alpha1api.SnapshotRestore) error {
 	oldData, err := json.Marshal(ssr)
 	if err != nil {
 		return errors.Wrap(err, "error marshalling original SnapshotRestore")
@@ -381,7 +382,7 @@ func cancelSnapshotRestore(ctx context.Context, veleroClient *veleroClientSet.Cl
 		return errors.Wrap(err, "error creating json merge patch for SnapshotRestore")
 	}
 
-	_, err = veleroClient.VeleroV1().SnapshotRestores(ssr.Namespace).Patch(ctx, ssr.Name, types.MergePatchType, patchData, metav1.PatchOptions{})
+	_, err = veleroClient.VeleroV1alpha1().SnapshotRestores(ssr.Namespace).Patch(ctx, ssr.Name, types.MergePatchType, patchData, metav1.PatchOptions{})
 	if err != nil {
 		return err
 	}

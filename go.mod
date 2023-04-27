@@ -132,4 +132,4 @@ require (
 	sigs.k8s.io/yaml v1.3.0 // indirect
 )
 
-replace github.com/vmware-tanzu/velero => github.com/Lyndon-Li/velero v0.0.0-20230329040221-98c272475add
+replace github.com/vmware-tanzu/velero => github.com/Lyndon-Li/velero v0.0.0-20230424074144-0337ec3bfb16
