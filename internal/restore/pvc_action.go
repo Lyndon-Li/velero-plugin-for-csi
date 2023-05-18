@@ -245,6 +245,8 @@ func restoreFromDataMovement(ctx context.Context, veleroClient *veleroClientSet.
 	}
 
 	pvc.Spec.VolumeName = ""
+	removePVCAnnotations(pvc, []string{util.KubeAnnSelectedNode})
+
 	if pvc.Spec.Selector == nil {
 		pvc.Spec.Selector = &metav1.LabelSelector{}
 	}
