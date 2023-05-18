@@ -38,4 +38,6 @@ const (
 
 	// Velero checks this annotation to determine whether to skip resource excluding check.
 	MustIncludeAdditionalItemAnnotation = "backup.velero.io/must-include-additional-items"
+
+	KubeAnnSelectedNode = "volume.kubernetes.io/selected-node"
 )
