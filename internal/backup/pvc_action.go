@@ -306,6 +306,11 @@ func (p *PVCBackupItemAction) Cancel(operationID string, backup *velerov1api.Bac
 
 func newDataUpload(backup *velerov1api.Backup, vs *snapshotv1api.VolumeSnapshot,
 	pvc *corev1api.PersistentVolumeClaim, operationID string) *velerov2alpha1.DataUpload {
+	snapshotType := velerov2alpha1.SnapshotTypeCSI
+	if backup.Spec.DataMover == "velero-vsphere-csi" {
+		snapshotType = velerov2alpha1.SnapshotTypeVsphereCSI
+	}
+
 	dataUpload := &velerov2alpha1.DataUpload{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: velerov2alpha1.SchemeGroupVersion.String(),
@@ -331,7 +336,7 @@ func newDataUpload(backup *velerov1api.Backup, vs *snapshotv1api.VolumeSnapshot,
 			},
 		},
 		Spec: velerov2alpha1.DataUploadSpec{
-			SnapshotType: velerov2alpha1.SnapshotTypeCSI,
+			SnapshotType: snapshotType,
 			CSISnapshot: &velerov2alpha1.CSISnapshotSpec{
 				VolumeSnapshot: vs.Name,
 				StorageClass:   *pvc.Spec.StorageClassName,
