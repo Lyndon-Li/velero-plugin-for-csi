@@ -58,7 +58,17 @@ func newPVCBackupItemAction(logger logrus.FieldLogger) (interface{}, error) {
 }
 
 func newVolumeSnapshotBackupItemAction(logger logrus.FieldLogger) (interface{}, error) {
-	return &backup.VolumeSnapshotBackupItemAction{Log: logger}, nil
+	client, snapshotClient, veleroClient, err := util.GetFullClients()
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	return &backup.VolumeSnapshotBackupItemAction{
+		Log:            logger,
+		Client:         client,
+		SnapshotClient: snapshotClient,
+		VeleroClient:   veleroClient,
+	}, nil
 }
 
 func newVolumesnapshotClassBackupItemAction(logger logrus.FieldLogger) (interface{}, error) {

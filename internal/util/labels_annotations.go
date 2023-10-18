@@ -27,6 +27,8 @@ const (
 	VolumeSnapshotClassSelectorLabel                = "velero.io/csi-volumesnapshot-class"
 	VolumeSnapshotClassDriverBackupAnnotationPrefix = "velero.io/csi-volumesnapshot-class"
 	VolumeSnapshotClassDriverPVCAnnotation          = "velero.io/csi-volumesnapshot-class"
+	SnapshotAliasLabel                              = "velero.io/snapshot-alias-name"
+	SnapshotVolumeLabel                             = "velero.io/snapshot-volume-name"
 
 	// There is no release w/ these constants exported. Using the strings for now.
 	// CSI Labels volumesnapshotclass

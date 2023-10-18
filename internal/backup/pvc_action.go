@@ -18,10 +18,8 @@ package backup
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 
-	jsonpatch "github.com/evanphx/json-patch"
 	snapshotv1api "github.com/kubernetes-csi/external-snapshotter/client/v4/apis/volumesnapshot/v1"
 	snapshotterClientSet "github.com/kubernetes-csi/external-snapshotter/client/v4/clientset/versioned"
 	"github.com/pkg/errors"
@@ -30,14 +28,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 
 	"github.com/vmware-tanzu/velero-plugin-for-csi/internal/util"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
-	velerov2alpha1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v2alpha1"
 	veleroClientSet "github.com/vmware-tanzu/velero/pkg/generated/clientset/versioned"
 	"github.com/vmware-tanzu/velero/pkg/kuberesource"
 	"github.com/vmware-tanzu/velero/pkg/label"
@@ -53,6 +48,11 @@ type PVCBackupItemAction struct {
 	SnapshotClient snapshotterClientSet.Interface
 	VeleroClient   veleroClientSet.Interface
 }
+
+// const (
+// 	snapshotAliasLabel  = "velero.io/snapshot-alias-name"
+// 	snapshotVolumeLabel = "velero.io/snapshot-volume"
+// )
 
 // AppliesTo returns information indicating that the PVCBackupItemAction should be invoked to backup PVCs.
 func (p *PVCBackupItemAction) AppliesTo() (velero.ResourceSelector, error) {
@@ -170,62 +170,12 @@ func (p *PVCBackupItemAction) Execute(item runtime.Unstructured, backup *velerov
 		util.MustIncludeAdditionalItemAnnotation: "true",
 	}
 
-	var additionalItems []velero.ResourceIdentifier
-	operationID := ""
-	var itemToUpdate []velero.ResourceIdentifier
-
-	if boolptr.IsSetToTrue(backup.Spec.SnapshotMoveData) {
-		operationID = label.GetValidName(string(velerov1api.AsyncOperationIDPrefixDataUpload) + string(backup.UID) + "." + string(pvc.UID))
-		dataUploadLog := p.Log.WithFields(logrus.Fields{
-			"Source PVC":     fmt.Sprintf("%s/%s", pvc.Namespace, pvc.Name),
-			"VolumeSnapshot": fmt.Sprintf("%s/%s", upd.Namespace, upd.Name),
-			"Operation ID":   operationID,
-			"Backup":         backup.Name,
-		})
-
-		// Wait until VS associated VSC snapshot handle created before returning with
-		// the Async operation for data mover.
-		_, err := util.GetVolumeSnapshotContentForVolumeSnapshot(upd, p.SnapshotClient.SnapshotV1(),
-			dataUploadLog, true, backup.Spec.CSISnapshotTimeout.Duration)
-		if err != nil {
-			dataUploadLog.Errorf("Fail to wait VolumeSnapshot snapshot handle created: %s", err.Error())
-			util.CleanupVolumeSnapshot(upd, p.SnapshotClient.SnapshotV1(), p.Log)
-			return nil, nil, "", nil, errors.WithStack(err)
-		}
-
-		dataUploadLog.Info("Starting data upload of backup")
-
-		dataUpload, err := createDataUpload(context.Background(), backup, p.VeleroClient, upd, &pvc, operationID)
-		if err != nil {
-			dataUploadLog.WithError(err).Error("failed to submit DataUpload")
-			util.DeleteVolumeSnapshotIfAny(context.Background(), p.SnapshotClient, *upd, dataUploadLog)
-
-			return nil, nil, "", nil, errors.Wrapf(err, "error creating DataUpload")
-		} else {
-			itemToUpdate = []velero.ResourceIdentifier{
-				{
-					GroupResource: schema.GroupResource{
-						Group:    "velero.io",
-						Resource: "datauploads",
-					},
-					Namespace: dataUpload.Namespace,
-					Name:      dataUpload.Name,
-				},
-			}
-			// Set the DataUploadNameLabel, which is used for restore to let CSI plugin check whether
-			// it should handle the volume. If volume is CSI migration, PVC doesn't have the annotation.
-			annotations[util.DataUploadNameAnnotation] = dataUpload.Namespace + "/" + dataUpload.Name
-
-			dataUploadLog.Info("DataUpload is submitted successfully.")
-		}
-	} else {
-		additionalItems = []velero.ResourceIdentifier{
-			{
-				GroupResource: kuberesource.VolumeSnapshots,
-				Namespace:     upd.Namespace,
-				Name:          upd.Name,
-			},
-		}
+	additionalItems := []velero.ResourceIdentifier{
+		{
+			GroupResource: kuberesource.VolumeSnapshots,
+			Namespace:     upd.Namespace,
+			Name:          upd.Name,
+		},
 	}
 
 	util.AddAnnotations(&pvc.ObjectMeta, annotations)
@@ -241,7 +191,7 @@ func (p *PVCBackupItemAction) Execute(item runtime.Unstructured, backup *velerov
 		return nil, nil, "", nil, errors.WithStack(err)
 	}
 
-	return &unstructured.Unstructured{Object: pvcMap}, additionalItems, operationID, itemToUpdate, nil
+	return &unstructured.Unstructured{Object: pvcMap}, additionalItems, "", nil, nil
 }
 
 func (p *PVCBackupItemAction) Name() string {
@@ -254,155 +204,9 @@ func (p *PVCBackupItemAction) Progress(operationID string, backup *velerov1api.B
 		return progress, biav2.InvalidOperationIDError(operationID)
 	}
 
-	dataUpload, err := getDataUpload(context.Background(), backup, p.VeleroClient, operationID)
-	if err != nil {
-		p.Log.Errorf("fail to get DataUpload for backup %s/%s: %s", backup.Namespace, backup.Name, err.Error())
-		return progress, err
-	}
-	if dataUpload.Status.Phase == velerov2alpha1.DataUploadPhaseNew || dataUpload.Status.Phase == "" {
-		p.Log.Debugf("DataUpload is still not processed yet. Skip progress update.")
-		return progress, nil
-	}
-
-	progress.Description = string(dataUpload.Status.Phase)
-	progress.OperationUnits = "Bytes"
-	progress.NCompleted = dataUpload.Status.Progress.BytesDone
-	progress.NTotal = dataUpload.Status.Progress.TotalBytes
-
-	if dataUpload.Status.StartTimestamp != nil {
-		progress.Started = dataUpload.Status.StartTimestamp.Time
-	}
-
-	if dataUpload.Status.CompletionTimestamp != nil {
-		progress.Updated = dataUpload.Status.CompletionTimestamp.Time
-	}
-
-	if dataUpload.Status.Phase == velerov2alpha1.DataUploadPhaseCompleted {
-		progress.Completed = true
-	} else if dataUpload.Status.Phase == velerov2alpha1.DataUploadPhaseFailed {
-		progress.Completed = true
-		progress.Err = dataUpload.Status.Message
-	} else if dataUpload.Status.Phase == velerov2alpha1.DataUploadPhaseCanceled {
-		progress.Completed = true
-		progress.Err = "DataUpload is canceled"
-	}
-
 	return progress, nil
 }
 
 func (p *PVCBackupItemAction) Cancel(operationID string, backup *velerov1api.Backup) error {
-	if operationID == "" {
-		return biav2.InvalidOperationIDError(operationID)
-	}
-
-	dataUpload, err := getDataUpload(context.Background(), backup, p.VeleroClient, operationID)
-	if err != nil {
-		p.Log.Errorf("fail to get DataUpload for backup %s/%s: %s", backup.Namespace, backup.Name, err.Error())
-		return err
-	}
-
-	return cancelDataUpload(context.Background(), p.VeleroClient, dataUpload)
-}
-
-func newDataUpload(backup *velerov1api.Backup, vs *snapshotv1api.VolumeSnapshot,
-	pvc *corev1api.PersistentVolumeClaim, operationID string) *velerov2alpha1.DataUpload {
-	dataUpload := &velerov2alpha1.DataUpload{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: velerov2alpha1.SchemeGroupVersion.String(),
-			Kind:       "DataUpload",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace:    backup.Namespace,
-			GenerateName: backup.Name + "-",
-			OwnerReferences: []metav1.OwnerReference{
-				{
-					APIVersion: velerov1api.SchemeGroupVersion.String(),
-					Kind:       "Backup",
-					Name:       backup.Name,
-					UID:        backup.UID,
-					Controller: boolptr.True(),
-				},
-			},
-			Labels: map[string]string{
-				velerov1api.BackupNameLabel:       label.GetValidName(backup.Name),
-				velerov1api.BackupUIDLabel:        string(backup.UID),
-				velerov1api.PVCUIDLabel:           string(pvc.UID),
-				velerov1api.AsyncOperationIDLabel: operationID,
-			},
-		},
-		Spec: velerov2alpha1.DataUploadSpec{
-			SnapshotType: velerov2alpha1.SnapshotTypeCSI,
-			CSISnapshot: &velerov2alpha1.CSISnapshotSpec{
-				VolumeSnapshot: vs.Name,
-				StorageClass:   *pvc.Spec.StorageClassName,
-			},
-			SourcePVC:             pvc.Name,
-			DataMover:             backup.Spec.DataMover,
-			BackupStorageLocation: backup.Spec.StorageLocation,
-			SourceNamespace:       pvc.Namespace,
-			OperationTimeout:      backup.Spec.CSISnapshotTimeout,
-		},
-	}
-
-	return dataUpload
-}
-
-func createDataUpload(ctx context.Context, backup *velerov1api.Backup, veleroClient veleroClientSet.Interface,
-	vs *snapshotv1api.VolumeSnapshot, pvc *corev1api.PersistentVolumeClaim, operationID string) (*velerov2alpha1.DataUpload, error) {
-	dataUpload := newDataUpload(backup, vs, pvc, operationID)
-
-	dataUpload, err := veleroClient.VeleroV2alpha1().DataUploads(dataUpload.Namespace).Create(ctx, dataUpload, metav1.CreateOptions{})
-	if err != nil {
-		return nil, errors.Wrap(err, "fail to create DataUpload CR")
-	}
-
-	return dataUpload, err
-}
-
-func getDataUpload(ctx context.Context, backup *velerov1api.Backup,
-	veleroClient veleroClientSet.Interface, operationID string) (*velerov2alpha1.DataUpload, error) {
-	listOptions := metav1.ListOptions{LabelSelector: fmt.Sprintf("%s=%s", velerov1api.AsyncOperationIDLabel, operationID)}
-
-	dataUploadList, err := veleroClient.VeleroV2alpha1().DataUploads(backup.Namespace).List(context.Background(), listOptions)
-	if err != nil {
-		return nil, errors.Wrapf(err, "error to list DataUpload")
-	}
-
-	if len(dataUploadList.Items) == 0 {
-		return nil, errors.Errorf("not found DataUpload for operationID %s", operationID)
-	}
-
-	if len(dataUploadList.Items) > 1 {
-		return nil, errors.Errorf("more than one DataUpload found operationID %s", operationID)
-	}
-
-	return &dataUploadList.Items[0], nil
-}
-
-func cancelDataUpload(ctx context.Context, veleroClient veleroClientSet.Interface,
-	dataUpload *velerov2alpha1.DataUpload) error {
-	oldData, err := json.Marshal(dataUpload)
-	if err != nil {
-		return errors.Wrap(err, "error marshalling original DataUpload")
-	}
-
-	updatedDataUpload := dataUpload.DeepCopy()
-	updatedDataUpload.Spec.Cancel = true
-
-	newData, err := json.Marshal(updatedDataUpload)
-	if err != nil {
-		return errors.Wrap(err, "err marshalling updated DataUpload")
-	}
-
-	patchData, err := jsonpatch.CreateMergePatch(oldData, newData)
-	if err != nil {
-		return errors.Wrap(err, "error creating patch data for DataUpload")
-	}
-
-	_, err = veleroClient.VeleroV2alpha1().DataUploads(dataUpload.Namespace).Patch(ctx, dataUpload.Name, types.MergePatchType, patchData, metav1.PatchOptions{})
-	if err != nil {
-		return errors.Wrap(err, "error patch DataUpload")
-	}
-
 	return nil
 }

@@ -39,7 +39,7 @@ import (
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	veleroClientSet "github.com/vmware-tanzu/velero/pkg/generated/clientset/versioned"
 	"github.com/vmware-tanzu/velero/pkg/label"
-	"github.com/vmware-tanzu/velero/pkg/podvolume"
+	"github.com/vmware-tanzu/velero/pkg/util/podvolume"
 )
 
 const (
@@ -513,4 +513,18 @@ func DeleteVolumeSnapshotIfAny(ctx context.Context, snapshotClient snapshotterCl
 	if err := snapshotClient.SnapshotV1().VolumeSnapshots(vs.Namespace).Delete(ctx, vs.Name, metav1.DeleteOptions{}); err != nil {
 		log.WithError(err).Warnf("fail to delete VolumeSnapshot %s/%s", vs.Namespace, vs.Name)
 	}
+}
+
+func GetPVCFromVolumeSnapshot(ctx context.Context, pvcGetter corev1client.CoreV1Interface, vs *snapshotv1api.VolumeSnapshot) (*corev1api.PersistentVolumeClaim, error) {
+	if vs.Spec.Source.PersistentVolumeClaimName == nil {
+		return nil, errors.Errorf("invalid PVC in VS %s/%s", vs.Namespace, vs.Name)
+	}
+
+	pvcName := *vs.Spec.Source.PersistentVolumeClaimName
+	pvc, err := pvcGetter.PersistentVolumeClaims(vs.Namespace).Get(ctx, pvcName, metav1.GetOptions{})
+	if err != nil {
+		return nil, errors.Wrapf(err, "error to get PVC %s/%s", vs.Namespace, pvcName)
+	}
+
+	return pvc, nil
 }

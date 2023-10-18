@@ -152,10 +152,6 @@ func (p *PVCRestoreItemAction) Execute(input *velero.RestoreItemActionExecuteInp
 
 	operationID := ""
 
-	// remove the volumesnapshot name annotation as well
-	// clean the DataUploadNameLabel for snapshot data mover case.
-	removePVCAnnotations(&pvc, []string{util.VolumeSnapshotLabel, util.DataUploadNameAnnotation})
-
 	if boolptr.IsSetToFalse(input.Restore.Spec.RestorePVs) {
 		logger.Info("Restore did not request for PVs to be restored from snapshot")
 		pvc.Spec.VolumeName = ""
@@ -169,21 +165,21 @@ func (p *PVCRestoreItemAction) Execute(input *velero.RestoreItemActionExecuteInp
 			return nil, fmt.Errorf("fail to get backup for restore: %s", err.Error())
 		}
 
-		if boolptr.IsSetToTrue(backup.Spec.SnapshotMoveData) {
+		localSnapshot := findLocalSnapshot(context.Background(), p.SnapshotClient, &pvcFromBackup, logger)
+		dataUploadResult := getDataUploadResult(context.Background(), input.Restore, &pvcFromBackup, p.Client, backup, logger)
+
+		if localSnapshot {
+			logger.Info("Start restore from VS.")
+
+			if err := restoreFromVolumeSnapshot(&pvc, newNamespace, p.SnapshotClient, pvcFromBackup.Annotations[util.VolumeSnapshotLabel], logger); err != nil {
+				logger.Errorf("Failed to restore PVC from VolumeSnapshot.")
+				return nil, errors.WithStack(err)
+			}
+		} else if dataUploadResult != nil {
 			logger.Info("Start DataMover restore.")
 
-			// If PVC doesn't have a DataUploadNameLabel, which should be created
-			// during backup, then CSI cannot handle the volume during to restore,
-			// so return early to let Velero tries to fall back to Velero native snapshot.
-			if _, ok := pvcFromBackup.Annotations[util.DataUploadNameAnnotation]; !ok {
-				logger.Warnf("PVC doesn't have a DataUpload for data mover. Return.")
-				return &velero.RestoreItemActionExecuteOutput{
-					UpdatedItem: input.Item,
-				}, nil
-			}
-
 			operationID = label.GetValidName(string(velerov1api.AsyncOperationIDPrefixDataDownload) + string(input.Restore.UID) + "." + string(pvcFromBackup.UID))
-			dataDownload, err := restoreFromDataUploadResult(context.Background(), input.Restore, backup, &pvc, newNamespace,
+			dataDownload, err := restoreFromDataUploadResult(context.Background(), input.Restore, backup, &pvc, dataUploadResult, newNamespace,
 				operationID, p.Client, p.VeleroClient)
 			if err != nil {
 				logger.Errorf("Fail to restore from DataUploadResult: %s", err.Error())
@@ -191,18 +187,11 @@ func (p *PVCRestoreItemAction) Execute(input *velero.RestoreItemActionExecuteInp
 			}
 			logger.Infof("DataDownload %s/%s is created successfully.", dataDownload.Namespace, dataDownload.Name)
 		} else {
-			volumeSnapshotName, ok := pvcFromBackup.Annotations[util.VolumeSnapshotLabel]
-			if !ok {
-				logger.Info("Skipping PVCRestoreItemAction for PVC , PVC does not have a CSI volumesnapshot.")
-				// Make no change in the input PVC.
-				return &velero.RestoreItemActionExecuteOutput{
-					UpdatedItem: input.Item,
-				}, nil
-			}
-			if err := restoreFromVolumeSnapshot(&pvc, newNamespace, p.SnapshotClient, volumeSnapshotName, logger); err != nil {
-				logger.Errorf("Failed to restore PVC from VolumeSnapshot.")
-				return nil, errors.WithStack(err)
-			}
+			logger.Info("Skipping PVCRestoreItemAction for PVC , PVC does not have a CSI volumesnapshot or dataupload.")
+			// Make no change in the input PVC.
+			return &velero.RestoreItemActionExecuteOutput{
+				UpdatedItem: input.Item,
+			}, nil
 		}
 	}
 
@@ -262,7 +251,7 @@ func (p *PVCRestoreItemAction) Progress(operationID string, restore *velerov1api
 		progress.Completed = true
 	} else if dataDownload.Status.Phase == velerov2alpha1.DataDownloadPhaseCanceled {
 		progress.Completed = true
-		progress.Err = fmt.Sprintf("DataDownload is canceled")
+		progress.Err = "DataDownload is canceled"
 	} else if dataDownload.Status.Phase == velerov2alpha1.DataDownloadPhaseFailed {
 		progress.Completed = true
 		progress.Err = dataDownload.Status.Message
@@ -299,36 +288,46 @@ func (p *PVCRestoreItemAction) AreAdditionalItemsReady(additionalItems []velero.
 }
 
 func getDataUploadResult(ctx context.Context, restore *velerov1api.Restore, pvc *corev1api.PersistentVolumeClaim,
-	kubeClient kubernetes.Interface) (*velerov2alpha1.DataUploadResult, error) {
+	kubeClient kubernetes.Interface, backup *velerov1api.Backup, logger logrus.FieldLogger) *velerov2alpha1.DataUploadResult {
+	if !boolptr.IsSetToTrue(backup.Spec.SnapshotMoveData) {
+		logger.Infof("Data movement is not engaged to this backup %s", backup.Name)
+		return nil
+	}
+
 	labelSelector := fmt.Sprintf("%s=%s,%s=%s,%s=%s", velerov1api.PVCNamespaceNameLabel, label.GetValidName(pvc.Namespace+"."+pvc.Name),
 		velerov1api.RestoreUIDLabel, label.GetValidName(string(restore.UID)),
 		velerov1api.ResourceUsageLabel, label.GetValidName(string(velerov1api.VeleroResourceUsageDataUploadResult)),
 	)
 	cmList, err := kubeClient.CoreV1().ConfigMaps(restore.Namespace).List(ctx, metav1.ListOptions{LabelSelector: labelSelector})
 	if err != nil {
-		return nil, errors.Wrapf(err, "error to get DataUpload result cm with labels %s", labelSelector)
+		logger.WithError(err).Errorf("Failed to get DataUpload result cm with labels %s", labelSelector)
+		return nil
 	}
 
 	if len(cmList.Items) == 0 {
-		return nil, errors.Errorf("no DataUpload result cm found with labels %s", labelSelector)
+		logger.WithError(err).Errorf("No DataUpload result cm found with labels %s", labelSelector)
+		return nil
 	}
 
 	if len(cmList.Items) > 1 {
-		return nil, errors.Errorf("multiple DataUpload result cms found with labels %s", labelSelector)
+		logger.WithError(err).Errorf("Multiple DataUpload result cms found with labels %s", labelSelector)
+		return nil
 	}
 
 	jsonBytes, exist := cmList.Items[0].Data[string(restore.UID)]
 	if !exist {
-		return nil, errors.Errorf("no DataUpload result found with restore key %s, restore %s", string(restore.UID), restore.Name)
+		logger.WithError(err).Errorf("No DataUpload result found with restore key %s, restore %s", string(restore.UID), restore.Name)
+		return nil
 	}
 
 	result := velerov2alpha1.DataUploadResult{}
 	err = json.Unmarshal([]byte(jsonBytes), &result)
 	if err != nil {
-		return nil, errors.Errorf("error to unmarshal DataUploadResult, restore UID %s, restore name %s", string(restore.UID), restore.Name)
+		logger.WithError(err).Errorf("Failed to unmarshal DataUploadResult, restore UID %s, restore name %s", string(restore.UID), restore.Name)
+		return nil
 	}
 
-	return &result, nil
+	return &result
 }
 
 func getDataDownload(ctx context.Context, namespace string, operationID string, veleroClient veleroClientSet.Interface) (*velerov2alpha1.DataDownload, error) {
@@ -444,11 +443,7 @@ func restoreFromVolumeSnapshot(pvc *corev1api.PersistentVolumeClaim, newNamespac
 }
 
 func restoreFromDataUploadResult(ctx context.Context, restore *velerov1api.Restore, backup *velerov1api.Backup, pvc *corev1api.PersistentVolumeClaim,
-	newNamespace, operationID string, kubeClient kubernetes.Interface, veleroClient veleroClientSet.Interface) (*velerov2alpha1.DataDownload, error) {
-	dataUploadResult, err := getDataUploadResult(ctx, restore, pvc, kubeClient)
-	if err != nil {
-		return nil, errors.Wrapf(err, "fail get DataUploadResult for restore: %s", restore.Name)
-	}
+	dataUploadResult *velerov2alpha1.DataUploadResult, newNamespace, operationID string, kubeClient kubernetes.Interface, veleroClient veleroClientSet.Interface) (*velerov2alpha1.DataDownload, error) {
 	pvc.Spec.VolumeName = ""
 	if pvc.Spec.Selector == nil {
 		pvc.Spec.Selector = &metav1.LabelSelector{}
@@ -459,7 +454,7 @@ func restoreFromDataUploadResult(ctx context.Context, restore *velerov1api.Resto
 	pvc.Spec.Selector.MatchLabels[util.DynamicPVRestoreLabel] = label.GetValidName(fmt.Sprintf("%s.%s.%s", newNamespace, pvc.Name, utilrand.String(GenerateNameRandomLength)))
 
 	dataDownload := newDataDownload(restore, backup, dataUploadResult, pvc, newNamespace, operationID)
-	_, err = veleroClient.VeleroV2alpha1().DataDownloads(restore.Namespace).Create(ctx, dataDownload, metav1.CreateOptions{})
+	_, err := veleroClient.VeleroV2alpha1().DataDownloads(restore.Namespace).Create(ctx, dataDownload, metav1.CreateOptions{})
 	if err != nil {
 		return nil, errors.Wrapf(err, "fail to create DataDownload")
 	}
@@ -477,4 +472,20 @@ func (p *PVCRestoreItemAction) isResourceExist(pvc corev1api.PersistentVolumeCla
 		return true
 	}
 	return false
+}
+
+func findLocalSnapshot(ctx context.Context, snapshotClient snapshotterClientSet.Interface, pvc *corev1api.PersistentVolumeClaim, logger logrus.FieldLogger) bool {
+	vsName, exists := pvc.Annotations[util.VolumeSnapshotLabel]
+	if !exists {
+		logrus.Warnf("PVC doesn't have annotation %s, PVC %s/%s", util.VolumeSnapshotLabel, pvc.Namespace, pvc.Name)
+		return false
+	}
+
+	_, err := snapshotClient.SnapshotV1().VolumeSnapshots(pvc.Namespace).Get(ctx, vsName, metav1.GetOptions{})
+	if err != nil {
+		logger.WithError(err).Warnf("Failed to get snapshot %s/%s", pvc.Namespace, vsName)
+		return false
+	}
+
+	return true
 }
