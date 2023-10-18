@@ -200,7 +200,6 @@ func (p *VolumeSnapshotBackupItemAction) Execute(item runtime.Unstructured, back
 			if err != nil {
 				return nil, nil, "", nil, errors.WithStack(err)
 			}
-
 		} else {
 			// The operationID is of the form <namespace>/<volumesnapshot-name>/<started-time>
 			operationID = vs.Namespace + "/" + vs.Name + "/" + time.Now().Format(time.RFC3339)
@@ -520,6 +519,6 @@ func detectSnapshotRetain(ctx context.Context, snapshotClient snapshotterClientS
 		return false
 	}
 
-	logger.Info("Need to retain snapshots, limit %v, current %v", limit, len(listItem.Items))
+	logger.Infof("Need to retain snapshots, limit %v, current %v", limit, len(listItem.Items))
 	return true
 }

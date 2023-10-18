@@ -43,6 +43,8 @@ import (
 	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
 	riav2 "github.com/vmware-tanzu/velero/pkg/plugin/velero/restoreitemaction/v2"
 	"github.com/vmware-tanzu/velero/pkg/util/boolptr"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
 
 const (
@@ -165,7 +167,7 @@ func (p *PVCRestoreItemAction) Execute(input *velero.RestoreItemActionExecuteInp
 			return nil, fmt.Errorf("fail to get backup for restore: %s", err.Error())
 		}
 
-		localSnapshot := findLocalSnapshot(context.Background(), p.SnapshotClient, &pvcFromBackup, logger)
+		localSnapshot := findLocalSnapshot(context.Background(), p.SnapshotClient, newNamespace, &pvcFromBackup, logger)
 		dataUploadResult := getDataUploadResult(context.Background(), input.Restore, &pvcFromBackup, p.Client, backup, logger)
 
 		if localSnapshot {
@@ -474,16 +476,20 @@ func (p *PVCRestoreItemAction) isResourceExist(pvc corev1api.PersistentVolumeCla
 	return false
 }
 
-func findLocalSnapshot(ctx context.Context, snapshotClient snapshotterClientSet.Interface, pvc *corev1api.PersistentVolumeClaim, logger logrus.FieldLogger) bool {
+func findLocalSnapshot(ctx context.Context, snapshotClient snapshotterClientSet.Interface, targetNamespace string, pvc *corev1api.PersistentVolumeClaim, logger logrus.FieldLogger) bool {
 	vsName, exists := pvc.Annotations[util.VolumeSnapshotLabel]
 	if !exists {
 		logrus.Warnf("PVC doesn't have annotation %s, PVC %s/%s", util.VolumeSnapshotLabel, pvc.Namespace, pvc.Name)
 		return false
 	}
 
-	_, err := snapshotClient.SnapshotV1().VolumeSnapshots(pvc.Namespace).Get(ctx, vsName, metav1.GetOptions{})
+	_, err := snapshotClient.SnapshotV1().VolumeSnapshots(targetNamespace).Get(ctx, vsName, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return false
+	}
+
 	if err != nil {
-		logger.WithError(err).Warnf("Failed to get snapshot %s/%s", pvc.Namespace, vsName)
+		logger.WithError(err).Warnf("Failed to get snapshot %s/%s", targetNamespace, vsName)
 		return false
 	}
 

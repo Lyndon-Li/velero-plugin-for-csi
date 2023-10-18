@@ -139,7 +139,7 @@ func (p *VolumeSnapshotRestoreItemAction) Execute(input *velero.RestoreItemActio
 			if err != nil {
 				return nil, errors.Wrapf(err, "failed to create volumesnapshotcontents %s", vsc.GenerateName)
 			}
-			p.Log.Infof("Created VolumesnapshotContents %s with static binding to volumesnapshot %s/%s", vscupd, newNamespace, vs.Name)
+			p.Log.Infof("Created VolumesnapshotContents %s with static binding to volumesnapshot %s/%s", vscupd.Name, newNamespace, vs.Name)
 
 			// Reset Spec to convert the volumesnapshot from using the dyanamic volumesnapshotcontent to the static one.
 			resetVolumeSnapshotSpecForRestore(&vs, &vscupd.Name)
@@ -197,13 +197,13 @@ func (p *VolumeSnapshotRestoreItemAction) AreAdditionalItemsReady(additionalItem
 func findSnapshotRetained(ctx context.Context, snapshotClient snapshotterClientSet.Interface, vs *snapshotv1api.VolumeSnapshot, logger logrus.FieldLogger) bool {
 	snapHandle, exists := vs.Annotations[util.VolumeSnapshotHandleAnnotation]
 	if !exists {
-		logger.Warnf("Volumesnapshot %s/%s does not have a %s annotation", vs.Namespace, vs.Name, util.VolumeSnapshotHandleAnnotation)
+		logger.Warnf("Volumesnapshot %s/%s does not have annotation %s", vs.Namespace, vs.Name, util.VolumeSnapshotHandleAnnotation)
 		return false
 	}
 
 	pvcID, exists := vs.Annotations[util.SnapshotVolumeLabel]
 	if !exists {
-		logger.Warnf("Volumesnapshot %s/%s does not have a %s annotation", vs.Namespace, vs.Name, util.SnapshotVolumeLabel)
+		logger.Warnf("Volumesnapshot %s/%s does not have annotation %s", vs.Namespace, vs.Name, util.SnapshotVolumeLabel)
 		return false
 	}
 
@@ -214,17 +214,28 @@ func findSnapshotRetained(ctx context.Context, snapshotClient snapshotterClientS
 		return false
 	}
 
+	var foundVSC *snapshotv1api.VolumeSnapshotContent
 	for _, vsc := range listItems.Items {
-		handle, exists := vsc.Annotations[util.VolumeSnapshotHandleAnnotation]
-		if !exists {
-			logger.Warnf("VolumeSnapshotContent %s does not have a %s annotation", vsc.Name, util.VolumeSnapshotHandleAnnotation)
+		if vsc.Status.SnapshotHandle == nil {
+			logger.Debugf("VolumeSnapshotContent %s does not have snapshot handle", vsc.Name)
 			continue
 		}
 
-		if handle == snapHandle {
-			return true
+		if *vsc.Status.SnapshotHandle == snapHandle {
+			foundVSC = &vsc
+			break
 		}
 	}
 
-	return false
+	if foundVSC == nil {
+		logger.Debugf("Not found VolumeSnapshotContent with snapshot handle %s", snapHandle)
+		return false
+	}
+
+	if boolptr.IsSetToFalse(foundVSC.Status.ReadyToUse) {
+		logger.WithError(err).Warnf("VolumeSnapshotContent is not ready to use, %s", foundVSC.Name)
+		return false
+	}
+
+	return true
 }
