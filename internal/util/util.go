@@ -19,6 +19,7 @@ package util
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -527,4 +528,87 @@ func GetPVCFromVolumeSnapshot(ctx context.Context, pvcGetter corev1client.CoreV1
 	}
 
 	return pvc, nil
+}
+
+func DeleteSnapshotReserveVSC(ctx context.Context, snapshotClient snapshotterClientSet.Interface, vsc *snapshotv1api.VolumeSnapshotContent) error {
+	newVSC := snapshotv1api.VolumeSnapshotContent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "velero-delete-" + vsc.Name,
+		},
+		Spec: snapshotv1api.VolumeSnapshotContentSpec{
+			DeletionPolicy:    snapshotv1api.VolumeSnapshotContentDelete,
+			Driver:            vsc.Spec.Driver,
+			VolumeSnapshotRef: vsc.Spec.VolumeSnapshotRef,
+			Source:            vsc.Spec.Source,
+		},
+	}
+
+	_, err := snapshotClient.SnapshotV1().VolumeSnapshotContents().Create(ctx, &newVSC, metav1.CreateOptions{})
+	if err != nil {
+		return errors.Wrapf(err, "error to create VSC")
+	}
+
+	interval := 1 * time.Second
+	timeout := 10 * time.Minute
+	err = wait.PollImmediate(interval, timeout, func() (bool, error) {
+		_, err := snapshotClient.SnapshotV1().VolumeSnapshotContents().Get(context.TODO(), newVSC.Name, metav1.GetOptions{})
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return false, errors.Wrapf(err, fmt.Sprintf("error to get VolumeSnapshotContent %s", vsc.Name))
+		}
+		return true, nil
+	})
+
+	if err != nil {
+		return errors.Wrap(err, "error to retrieve VolumeSnapshotContent info")
+	}
+
+	err = snapshotClient.SnapshotV1().VolumeSnapshotContents().Delete(ctx, newVSC.Name, metav1.DeleteOptions{})
+	if err != nil {
+		return errors.Wrap(err, "error to retrieve VolumeSnapshotContent info")
+	}
+
+	return nil
+}
+
+func GetRetainSnapshotLimit(backup *velerov1api.Backup) (int, error) {
+	limit := 0
+	if str, exists := backup.Annotations[velerov1api.DataMoverSnapshotToRetain]; exists {
+		if val, err := strconv.Atoi(str); err != nil {
+			return limit, errors.Wrapf(err, "error to parse limit from %s", str)
+		} else {
+			limit = val
+		}
+	}
+
+	return limit, nil
+}
+
+func EnsureDeleteVSC(ctx context.Context, snapshotClient snapshotterClientSet.Interface, vsc string, timeout time.Duration) error {
+	err := snapshotClient.SnapshotV1().VolumeSnapshotContents().Delete(ctx, vsc, metav1.DeleteOptions{})
+	if err != nil && !apierrors.IsNotFound(err) {
+		return errors.Wrapf(err, "error to delete volumesnapshotcontent %s", vsc)
+	}
+
+	interval := 1 * time.Second
+	err = wait.PollImmediate(interval, timeout, func() (bool, error) {
+		_, err := snapshotClient.SnapshotV1().VolumeSnapshotContents().Get(context.TODO(), vsc, metav1.GetOptions{})
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return true, nil
+			}
+
+			return false, errors.Wrapf(err, "error to check status of VolumeSnapshotContent %s", vsc)
+		}
+
+		return false, nil
+	})
+
+	if err != nil {
+		return errors.Wrapf(err, "error to wait deletion of VolumeSnapshotContent %s", vsc)
+	}
+
+	return nil
 }

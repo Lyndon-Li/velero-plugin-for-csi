@@ -19,6 +19,8 @@ package backup
 import (
 	"context"
 	"fmt"
+	"sort"
+	"time"
 
 	snapshotv1api "github.com/kubernetes-csi/external-snapshotter/client/v4/apis/volumesnapshot/v1"
 	snapshotterClientSet "github.com/kubernetes-csi/external-snapshotter/client/v4/clientset/versioned"
@@ -133,6 +135,21 @@ func (p *PVCBackupItemAction) Execute(item runtime.Unstructured, backup *velerov
 	}
 	p.Log.Infof("volumesnapshot class=%s", snapshotClass.Name)
 
+	if boolptr.IsSetToTrue(backup.Spec.SnapshotMoveData) {
+		limit, err := util.GetRetainSnapshotLimit(backup)
+		if err != nil {
+			p.Log.WithError(err).Error("Failed to get retain snapshot limit from backup")
+			return nil, nil, "", nil, errors.Wrapf(err, "error to get retain snapshot limit from backup")
+		}
+
+		if limit > 0 {
+			if err := gcRetainedSnapshots(context.TODO(), p.SnapshotClient, string(pvc.UID), limit, backup.Spec.CSISnapshotTimeout.Duration, p.Log); err != nil {
+				p.Log.WithError(err).Error("Failed to gc retained snapshots")
+				return nil, nil, "", nil, errors.Wrapf(err, "error to gc retained snapshots")
+			}
+		}
+	}
+
 	vsLabels := map[string]string{}
 	for k, v := range pvc.ObjectMeta.Labels {
 		vsLabels[k] = v
@@ -208,5 +225,67 @@ func (p *PVCBackupItemAction) Progress(operationID string, backup *velerov1api.B
 }
 
 func (p *PVCBackupItemAction) Cancel(operationID string, backup *velerov1api.Backup) error {
+	return nil
+}
+
+func gcRetainedSnapshots(ctx context.Context, snapshotClient snapshotterClientSet.Interface, pvcID string, limit int, operationTimeout time.Duration, logger logrus.FieldLogger) error {
+	labelSelector := util.SnapshotVolumeLabel + "=" + pvcID
+	listItem, err := snapshotClient.SnapshotV1().VolumeSnapshotContents().List(ctx, metav1.ListOptions{LabelSelector: labelSelector})
+	if err != nil {
+		return errors.Wrapf(err, "error to list snapshot contents with label %s", labelSelector)
+	}
+
+	retainedVSC := []*snapshotv1api.VolumeSnapshotContent{}
+	for i := 0; i < len(listItem.Items); i++ {
+		if _, exists := listItem.Items[i].Labels[velerov1api.DataMoverSnapshotRemoved]; !exists {
+			retainedVSC = append(retainedVSC, &listItem.Items[i])
+		}
+	}
+
+	if len(retainedVSC)+1 <= limit {
+		logger.Infof("Don't need to gc retained snapshots, total %v, limit %v", len(retainedVSC), limit)
+		return nil
+	}
+
+	logger.Infof("Need to gc retained snapshots, total %v, limit %v", len(retainedVSC), limit)
+
+	sort.Slice(retainedVSC, func(i, j int) bool {
+		return retainedVSC[i].CreationTimestamp.Before(&retainedVSC[j].CreationTimestamp)
+	})
+
+	for i := 0; i < len(retainedVSC)-limit+1; i++ {
+		logger.Infof("GC retained snapshot %s from backup %s", retainedVSC[i].Name, retainedVSC[i].Labels[velerov1api.BackupNameLabel])
+
+		err = util.SetVolumeSnapshotContentDeletionPolicy(retainedVSC[i].Name, snapshotClient.SnapshotV1())
+		if err != nil {
+			return errors.Wrapf(err, "error to set DeletionPolicy on volumesnapshotcontent %s", retainedVSC[i].Name)
+		}
+
+		err = util.EnsureDeleteVSC(ctx, snapshotClient, retainedVSC[i].Name, operationTimeout)
+		if err != nil {
+			return errors.Wrapf(err, "error to delete volumesnapshotcontent %s", retainedVSC[i].Name)
+		}
+
+		labels := retainedVSC[i].Labels
+		labels[velerov1api.DataMoverSnapshotRemoved] = "true"
+		sentinelVSC := snapshotv1api.VolumeSnapshotContent{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   retainedVSC[i].Name,
+				Labels: labels,
+			},
+			Spec: snapshotv1api.VolumeSnapshotContentSpec{
+				DeletionPolicy:    snapshotv1api.VolumeSnapshotContentRetain,
+				Driver:            retainedVSC[i].Spec.Driver,
+				VolumeSnapshotRef: retainedVSC[i].Spec.VolumeSnapshotRef,
+				Source:            retainedVSC[i].Spec.Source,
+			},
+		}
+
+		_, err = snapshotClient.SnapshotV1().VolumeSnapshotContents().Create(ctx, &sentinelVSC, metav1.CreateOptions{})
+		if err != nil {
+			logger.WithError(err).Warnf("error to create sentinel volumesnapshotcontent %s", sentinelVSC.Name)
+		}
+	}
+
 	return nil
 }

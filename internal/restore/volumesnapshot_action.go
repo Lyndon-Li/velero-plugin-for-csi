@@ -214,15 +214,22 @@ func findSnapshotRetained(ctx context.Context, snapshotClient snapshotterClientS
 		return false
 	}
 
+	logger.Infof("Found retained snapshot with handle %s, for volume %s, count %v", snapHandle, pvcID, len(listItems.Items))
+
 	var foundVSC *snapshotv1api.VolumeSnapshotContent
-	for _, vsc := range listItems.Items {
+	for i, vsc := range listItems.Items {
+		if vsc.Status == nil {
+			logger.Debugf("VolumeSnapshotContent %s does not have status", vsc.Name)
+			continue
+		}
+
 		if vsc.Status.SnapshotHandle == nil {
 			logger.Debugf("VolumeSnapshotContent %s does not have snapshot handle", vsc.Name)
 			continue
 		}
 
 		if *vsc.Status.SnapshotHandle == snapHandle {
-			foundVSC = &vsc
+			foundVSC = &listItems.Items[i]
 			break
 		}
 	}

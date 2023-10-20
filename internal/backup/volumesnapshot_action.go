@@ -366,7 +366,13 @@ func backupFromDataMover(ctx context.Context, veleroClient veleroClientSet.Inter
 
 	dataUploadLog.Info("Starting data upload of backup")
 
-	retainSnapshot := detectSnapshotRetain(context.TODO(), snapshotClient, string(pvc.UID), backup.Spec.SnapshotsToRetain, dataUploadLog)
+	limit, err := util.GetRetainSnapshotLimit(backup)
+	if err != nil {
+		dataUploadLog.WithError(err).Error("Failed to get retain snapshot limit from backup")
+		return "", nil, errors.Wrapf(err, "error to get retain snapshot limit from backup")
+	}
+
+	retainSnapshot := (limit > 0)
 	dataUpload, err := createDataUpload(context.Background(), backup, veleroClient, upd, pvc, operationID, retainSnapshot)
 	if err != nil {
 		dataUploadLog.WithError(err).Error("failed to submit DataUpload")
@@ -504,21 +510,4 @@ func cancelDataUpload(ctx context.Context, veleroClient veleroClientSet.Interfac
 	}
 
 	return nil
-}
-
-func detectSnapshotRetain(ctx context.Context, snapshotClient snapshotterClientSet.Interface, pvcID string, limit int, logger logrus.FieldLogger) bool {
-	labelSelector := util.SnapshotVolumeLabel + "=" + pvcID
-	listItem, err := snapshotClient.SnapshotV1().VolumeSnapshotContents().List(ctx, metav1.ListOptions{LabelSelector: labelSelector})
-	if err != nil {
-		logger.WithError(err).Warnf("Failed to list snapshot contents with label %s", labelSelector)
-		return false
-	}
-
-	if len(listItem.Items) > limit {
-		logger.Infof("Don't need to retain snapshots, limit %v, current %v", limit, len(listItem.Items))
-		return false
-	}
-
-	logger.Infof("Need to retain snapshots, limit %v, current %v", limit, len(listItem.Items))
-	return true
 }
